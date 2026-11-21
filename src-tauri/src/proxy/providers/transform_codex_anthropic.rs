@@ -59,11 +59,12 @@ pub(crate) fn effort_to_thinking_budget(effort: &str) -> Option<u64> {
     }
 }
 
-fn codex_effort_to_anthropic(effort: &str) -> Option<&'static str> {
+fn codex_effort_to_anthropic(effort: &str, model: &str) -> Option<&'static str> {
     match effort.trim().to_ascii_lowercase().as_str() {
         "minimal" | "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
+        "xhigh" if crate::proxy::thinking_optimizer::supports_xhigh_effort(model) => Some("xhigh"),
         "xhigh" | "max" | "ultra" => Some("max"),
         _ => None,
     }
@@ -314,8 +315,12 @@ pub fn responses_request_to_anthropic(
         .and_then(|value| value.as_str());
     let adaptive_model = crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
     let adaptive_by_default = crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
+    let normalized_model = model.to_ascii_lowercase().replace(['.', '_'], "-");
+    let haiku_highest_effort = normalized_model.contains("haiku-5-5")
+        && matches!(reasoning_effort, Some("xhigh" | "max" | "ultra"));
     let cannot_disable_thinking =
-        crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model);
+        crate::proxy::thinking_optimizer::thinking_cannot_be_disabled(model)
+            || haiku_highest_effort;
 
     // max_output_tokens → max_tokens (required)
     let max_tokens = body
@@ -331,7 +336,7 @@ pub fn responses_request_to_anthropic(
     let adaptive_should_think = adaptive_model
         && (adaptive_by_default
             || reasoning_effort
-                .and_then(codex_effort_to_anthropic)
+                .and_then(|effort| codex_effort_to_anthropic(effort, model))
                 .is_some());
 
     if !thinking_history_is_valid {
@@ -347,7 +352,9 @@ pub fn responses_request_to_anthropic(
     } else if adaptive_should_think && (!explicitly_disabled || cannot_disable_thinking) {
         thinking_enabled = true;
         result["thinking"] = json!({ "type": "adaptive" });
-        if let Some(effort) = reasoning_effort.and_then(codex_effort_to_anthropic) {
+        if let Some(effort) =
+            reasoning_effort.and_then(|effort| codex_effort_to_anthropic(effort, model))
+        {
             result["output_config"] = json!({ "effort": effort });
         } else if explicitly_disabled && cannot_disable_thinking {
             // Fable/Mythos cannot turn thinking off. `low` is the closest safe
@@ -2189,6 +2196,98 @@ mod tests {
 
         let opus = responses_request_to_anthropic(request("claude-opus-4.8"), 4096).unwrap();
         assert!(opus.get("thinking").is_none());
+    }
+
+    #[test]
+    fn current_claude_effort_levels_are_preserved() {
+        for model in [
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let result = responses_request_to_anthropic(
+                    json!({
+                        "model": model,
+                        "max_output_tokens": 16384,
+                        "reasoning": { "effort": effort },
+                        "input": [{"role": "user", "content": "local fixture"}]
+                    }),
+                    32000,
+                )
+                .unwrap();
+                assert_eq!(result["thinking"]["type"], "adaptive", "{model}/{effort}");
+                assert!(result["thinking"].get("budget_tokens").is_none());
+                assert_eq!(
+                    result["output_config"]["effort"], effort,
+                    "{model}/{effort}"
+                );
+                assert_eq!(result["max_tokens"], 16384);
+            }
+        }
+    }
+
+    #[test]
+    fn haiku_55_is_adaptive_by_default_without_changing_haiku_45() {
+        let request = |model| {
+            json!({
+                "model": model,
+                "reasoning": { "effort": "medium" },
+                "input": [{"role": "user", "content": "local fixture"}]
+            })
+        };
+        let current = responses_request_to_anthropic(request("claude-haiku-5-5"), 16384).unwrap();
+        assert_eq!(current["thinking"]["type"], "adaptive");
+        assert_eq!(current["output_config"]["effort"], "medium");
+        let old = responses_request_to_anthropic(request("claude-haiku-4-5"), 16384).unwrap();
+        assert_eq!(old["thinking"]["type"], "enabled");
+        assert_eq!(old["thinking"]["budget_tokens"], 8192);
+        let default = responses_request_to_anthropic(
+            json!({
+                "model": "claude-haiku-5-5", "input": [{"role":"user","content":"hi"}]
+            }),
+            16384,
+        )
+        .unwrap();
+        assert_eq!(default["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn xhigh_fallback_is_retained_for_models_without_the_native_tier() {
+        assert_eq!(
+            codex_effort_to_anthropic("xhigh", "claude-sonnet-4-6"),
+            Some("max")
+        );
+        assert_eq!(
+            codex_effort_to_anthropic("xhigh", "claude-opus-4-7"),
+            Some("xhigh")
+        );
+        assert_eq!(
+            codex_effort_to_anthropic("ultra", "claude-sonnet-5-5"),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn mandatory_thinking_models_reject_unsigned_tool_history_locally() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            let result = responses_request_to_anthropic(
+                json!({
+                    "model": model, "reasoning":{"effort":"xhigh"},
+                    "input": [
+                        {"role":"user","content":"local fixture"},
+                        {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"c1","output":"fixture"}
+                    ]
+                }),
+                16384,
+            );
+            assert!(
+                result.is_err(),
+                "{model} must not receive invalid disabled thinking"
+            );
+        }
     }
 
     #[test]

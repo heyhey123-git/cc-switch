@@ -1,6 +1,6 @@
 # Codex + CC Switch + Sub2API：Claude 接入与运维
 
-核对日期：2026-11-21。验证组合：CC Switch v4.0.31 本分支、
+核对日期：2026-11-22。验证组合：CC Switch v4.0.38 本分支、
 Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正式工作。
 本文和示例均不包含账户密钥、个人数据库或安装包。
 
@@ -12,25 +12,29 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | xhigh | 支持的型号保留 xhigh；旧型号保留原有 max 回退 |
 | Haiku 5.5 | 使用 adaptive thinking，不再发送旧式 budget_tokens |
 | Adaptive 工具续接 | 模型未输出思考块时仍允许回传合法工具结果；已有签名块原样保留 |
+| 工具顶层 oneOf / anyOf / allOf / $ref | 将完整约束置于对象属性内；返回参数和历史回放自动还原，兼容流式及命名空间工具 |
+| 工具参数中的 _id / _meta / __typename | 采用上游已包含的修复，保留原始工具参数 |
+| OpenAI 工具 strict 字段 | 采用上游修复，不将该字段透传给 Anthropic / Bedrock 工具定义 |
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
-| 本次部署的鉴权、真实缓存、图片、工具续接、摘要后继续 | 实网小额验收通过；其他部署按第 7 节验收 |
+| 鉴权、真实缓存、图片、工具续接、摘要后继续 | 旧修复版曾通过 Sonnet 小额实网验收；本次升级只执行不计费的本地回归，其他部署按第 7 节验收 |
 
-本分支已通过 92 项原生回归测试。模拟缓存计数只能证明用量转换，
+本次升级已通过 1983 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
+模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
-本次 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
+此前 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
 没有完成百万 token 压缩性能验收。
 
 ## 2. 获取并构建修复版
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.31-claude-fix.1/CC-Switch-4.0.31-Claude-Fix.1-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.1/CC-Switch-4.0.38-Claude-Fix.1-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
-这是个人 fork 的修复版，程序内版本仍显示 4.0.31，未使用官方签名证书。
+这是个人 fork 的修复版，程序内版本显示 4.0.38，未使用官方签名证书。
 安装包不包含 API Key、账户数据或供应商配置；安装后从第 3 节开始配置。
 安装官方新版可能覆盖本补丁，更新方式见第 9 节。
 
@@ -121,6 +125,10 @@ remote_compaction = "unsupported"
   "maxOutputTokens": 16384
 }
 ```
+
+CC Switch 的全局出站代理留空；需要选择出口、规则或 TUN 时在 Clash 中设置。
+Clash 必须绕过 `127.0.0.0/8`、`localhost` 和 `::1`，使 Codex 到 CCS 的本机连接直接可达。
+避免再在 CCS 内叠加 `http://127.0.0.1:7897` 等代理地址。
 
 关闭本地路由的自动故障转移。本文采用 HTTP SSE，
 将 provider 的 `supports_websockets` 设为 false，
@@ -228,6 +236,8 @@ Content-Type: application/json
 这些字段由 CC Switch 转换，日常使用者不必手动构造 JSON。
 缓存按相同前缀复用；模型、工具定义、图片、系统提示、thinking 设置或前缀历史改变时，
 命中范围可能改变。保持同一模型和会话，在缓存有效期内继续；不要后台反复预热。
+本修复会改变含顶层组合约束的工具定义，升级后的首轮可能重新写入这部分前缀；
+保持工具集稳定后再观察后续缓存读取，不用大上下文反复做升级验收。
 本地默认标记是 5 分钟，最多四个断点。Sub2API 的实际版本可能重写断点、
 TTL 或账号路由，需要结合商家的请求日志确认最终发给上游的内容。
 
@@ -352,6 +362,8 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 | 窗口提示 localhost 拒绝连接 | 确认使用包含前端的生产构建；无需为正式使用启动 3000 开发服务器 |
 | 本机 15721 拒绝连接 | 检查 CC Switch 正在运行、路由与 Codex 接管开关已打开 |
 | thinking/signature 400 | 保持同模型签名历史完整；已损坏的旧历史新建会话 |
+| input_schema 顶层 oneOf / allOf / anyOf 400 | 安装本修复版；保留原始 schema，不手工删除约束或工具 |
+| 502：connection closed / TLS EOF / 连接被重置 | 查看供应商和实际出站错误；CCS 出站代理留空，在 Clash 核对 TUN、DNS、规则及节点状态。本机 /responses 是客户端入口 |
 | 只缓存很小的固定前缀 | 查看实际 Messages 断点、TTL、会话路由和回传统计 |
 | 流中断、输出突然结束 | 核对内部 status/incomplete_details；不能只看 response.completed 事件名 |
 | strict JSON Schema | 当前转换会丢弃对应请求字段，不按严格结构化输出能力使用 |
@@ -362,12 +374,26 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 不要用反复大请求诊断认证、缓存和压缩问题。公开问题报告只上传去密钥日志，
 不上传 `auth.json`、CC Switch 数据库或含凭据的备份。
 
+CC Switch 的全局出站代理会同时影响 GPT 和 Claude，本方案将它留空。
+检查 502 时先记录错误时间，区分 Connect 建连超时、SendRequest 发送时断连和 SSE 流中断，
+再对齐 Clash 的内核日志与连接记录。重启恢复能说明链路状态发生改变，但不能单独确定
+具体是节点、TUN、DNS 还是连接状态异常。短请求正常不能代替长请求或 SSE 验证。
+本次 Claude 补丁没有修改共享 forwarder、连接池或 HTTP 客户端；上游版本升级包含自身变化。
+请求发送后断连时上游可能已经开始处理，不用提高自动重试次数掩盖错误。
+
+顶层组合 schema 兼容层只作用于 Codex 到 Anthropic 的工具转换。
+它将原始 schema 放在必填 `_ccs_input` 属性中，返回时拆除这一层，历史回放时再添加；
+本地 JSON pointer 引用随之调整，普通工具和属性内部的组合约束保持原样。
+非法包装参数会返回失败，不会把包装字段传给实际工具执行。
+
 ## 9. 更新与回归
 
-官方安装包更新可能覆盖本地修复，界面仍显示 4.0.31 也不能证明二进制相同。
-记录当前构建提交及文件 SHA256；在新版源码上检查这两个文件并迁移仍需要的补丁：
+官方安装包更新可能覆盖本地修复，界面显示相同版本也不能证明二进制相同。
+需要保留本补丁时关闭自动安装官方更新，从个人 fork 的后续修复发行版更新。
+记录当前构建提交及文件 SHA256；在新版源码上检查以下文件并迁移仍需要的补丁：
 
 - `src-tauri/src/proxy/providers/transform_codex_anthropic.rs`
+- `src-tauri/src/proxy/providers/streaming_codex_anthropic.rs`
 - `src-tauri/src/proxy/thinking_optimizer.rs`
 
 原生回归命令（不调用模型；测试目录使用一次性路径）：
@@ -375,13 +401,17 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 ```powershell
 cd src-tauri
 $env:CC_SWITCH_TEST_HOME = Join-Path ([IO.Path]::GetTempPath()) ("cc-switch-tests-" + [guid]::NewGuid())
-cargo +stable test --locked --lib proxy::providers::transform_codex_anthropic::tests -- --test-threads=1
-cargo +stable test --locked --lib proxy::thinking_optimizer::tests -- --test-threads=1
+# 仅在当前测试进程中让 loopback 绕过系统代理；保留原来的变量以便恢复。
+$previousNoProxy = $env:NO_PROXY
+$env:NO_PROXY = "127.0.0.1,localhost,::1"
+cargo +stable test --locked --lib proxy:: -- --test-threads=1
+$env:NO_PROXY = $previousNoProxy
 Remove-Item Env:CC_SWITCH_TEST_HOME
 ```
 
-两个命令必须都成功。跨版本时重新测试实际桌面 UI、四模型五档、图片、签名回放和
-压缩流程；不要将旧可执行文件覆盖到新版安装目录来“保留补丁”。
+回归命令必须成功。跨版本时重新测试实际桌面 UI、四模型五档、图片、签名回放、
+完整原生工具集、顶层组合 schema 的流式往返和压缩流程；同时以原生 Responses
+供应商做 GPT 转发对照。不要将旧可执行文件覆盖到新版安装目录来“保留补丁”。
 数据库恢复只处理明确需要的配置，勿用旧整库覆盖后续新数据。
 
 ## 参考资料

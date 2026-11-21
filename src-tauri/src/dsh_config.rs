@@ -16,7 +16,7 @@ use std::{
 /// DSH home: the directory set in CC Switch settings (e.g. a WSL path, #9239), then
 /// `DSH_HOME`, then `~/.dsh`.
 pub(crate) fn data_dir() -> PathBuf {
-    if let Some(dir) = crate::settings::get_dsh_override_dir() {
+    if let Some(dir) = crate::settings::get_override_dir(&crate::app_config::AppType::Dsh) {
         return dir;
     }
     std::env::var_os("DSH_HOME")
@@ -413,37 +413,47 @@ fn edit_files_and_commit<T>(
         )));
     }
     let mut written = vec![];
-    let result = paths
-        .iter()
-        .zip(&current)
-        .zip(&next)
-        .enumerate()
-        .filter(|(_, ((_, current), next))| current != next)
-        .try_for_each(|(index, ((path, _), next))| {
-            atomic_write_private(path, next.as_bytes())?;
-            written.push(index);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        paths
+            .iter()
+            .zip(&current)
+            .zip(&next)
+            .enumerate()
+            .filter(|(_, ((_, current), next))| current != next)
+            .try_for_each(|(index, ((path, _), next))| {
+                atomic_write_private(path, next.as_bytes())?;
+                written.push(index);
+                Ok(())
+            })
+            .and_then(|()| commit())
+    }));
+    let mut rollback = || {
+        let failures: Vec<_> = written
+            .iter()
+            .rev()
+            .filter_map(|&index| {
+                restore(&paths[index], previous[index].take())
+                    .err()
+                    .map(|rollback| rollback.to_string())
+            })
+            .collect();
+        if failures.is_empty() {
             Ok(())
-        })
-        .and_then(|()| commit());
+        } else {
+            Err(AppError::Message(format!(
+                "restoring DeepSeek Harness configuration failed: {}",
+                failures.join("; ")
+            )))
+        }
+    };
+    let result = crate::sync_utils::resume_after_rollback(outcome, &mut rollback);
     match result {
         Ok(result) => Ok(result),
         Err(error) => {
-            let failures: Vec<_> = written
-                .into_iter()
-                .rev()
-                .filter_map(|index| {
-                    restore(&paths[index], previous[index].take())
-                        .err()
-                        .map(|rollback| rollback.to_string())
-                })
-                .collect();
-            if failures.is_empty() {
-                Err(error)
+            if let Err(rollback_error) = rollback() {
+                Err(AppError::Message(format!("{error}; {rollback_error}")))
             } else {
-                Err(AppError::Message(format!(
-                    "{error}; restoring DeepSeek Harness configuration failed: {}",
-                    failures.join("; ")
-                )))
+                Err(error)
             }
         }
     }
@@ -966,6 +976,28 @@ pub(crate) fn initialize_profiles(
     initialize_profiles_and_commit(providers, servers, || Ok(()))
 }
 
+/// Whether some target profile has not been seeded yet. Lets a caller that can't build the full
+/// seed (an unreadable managed row) defer only when there is a profile it would actually miss.
+pub(crate) fn has_uninitialized_profiles() -> Result<bool, AppError> {
+    let initialized = parse_profile_receipt(&read_text(&profile_receipt_path())?)?;
+    Ok(target_paths()
+        .iter()
+        .any(|path| !initialized.contains(&profile_name(path))))
+}
+
+fn profile_receipt_path() -> PathBuf {
+    data_dir().join(".cc-switch-profile-sync.json")
+}
+
+fn parse_profile_receipt(text: &str) -> Result<Vec<String>, AppError> {
+    if text.trim().is_empty() {
+        Ok(vec![])
+    } else {
+        serde_json::from_str(text)
+            .map_err(|_| AppError::Config("Invalid DeepSeek Harness profile sync receipt".into()))
+    }
+}
+
 fn initialize_profiles_and_commit<T>(
     providers: &IndexMap<String, Value>,
     servers: &IndexMap<String, Value>,
@@ -975,16 +1007,8 @@ fn initialize_profiles_and_commit<T>(
         return commit();
     }
     let profiles = target_paths();
-    let receipt = data_dir().join(".cc-switch-profile-sync.json");
-    let parse_receipt = |text: &str| -> Result<Vec<String>, AppError> {
-        if text.trim().is_empty() {
-            Ok(vec![])
-        } else {
-            serde_json::from_str(text).map_err(|_| {
-                AppError::Config("Invalid DeepSeek Harness profile sync receipt".into())
-            })
-        }
-    };
+    let receipt = profile_receipt_path();
+    let parse_receipt = parse_profile_receipt;
     let initialized = parse_receipt(&read_text(&receipt)?)?;
     if profiles
         .iter()
@@ -2086,6 +2110,31 @@ mod tests {
         assert!(!path.with_extension("yml.lock").exists());
     }
 
+    #[test]
+    fn panicking_commit_restores_all_profiles_before_releasing_native_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing.yml");
+        let fresh = temp.path().join("new.yml");
+        fs::write(&existing, "# original\n[]\n").unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _: Result<(), AppError> = edit_files_and_commit(
+                &[existing.clone(), fresh.clone()],
+                |_| Ok(vec!["- id: changed\n".into(), "- id: new\n".into()]),
+                || {
+                    assert!(existing.with_extension("yml.lock").exists());
+                    assert!(fresh.with_extension("yml.lock").exists());
+                    panic!("commit interrupted");
+                },
+            );
+        })
+        .is_err());
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "# original\n[]\n");
+        assert!(!fresh.exists());
+        assert!(!existing.with_extension("yml.lock").exists());
+        assert!(!fresh.with_extension("yml.lock").exists());
+        edit_path_and_commit(&existing, |_| Ok("[]\n".into()), || Ok(())).unwrap();
+    }
+
     /// Points `DSH_HOME` at a temporary directory for one test and restores it afterwards.
     struct DshHome {
         dir: tempfile::TempDir,
@@ -2300,7 +2349,7 @@ mod tests {
                 live_config_managed: Some(managed),
                 ..Default::default()
             });
-            state.db.save_provider("dsh", &provider).unwrap();
+            state.db.save_provider(&AppType::Dsh, &provider).unwrap();
         }
         for (id, enabled) in [("fetch", true), ("disabled", false)] {
             state
@@ -2357,6 +2406,111 @@ mod tests {
         );
         assert_eq!(read_text(&desktop).unwrap(), native);
         assert!(!profile_path("acp").exists());
+    }
+
+    fn seed_rows_with_one_unreadable_mcp(dsh_enabled: bool) -> crate::store::AppState {
+        use crate::app_config::{AppType, McpApps, McpServer};
+        use crate::provider::{Provider, ProviderMeta};
+
+        let state = crate::store::AppState::new(std::sync::Arc::new(
+            crate::database::Database::memory().unwrap(),
+        ));
+        let mut provider =
+            Provider::with_id("gateway".into(), "gateway".into(), editor_config(), None);
+        provider.meta = Some(ProviderMeta {
+            live_config_managed: Some(true),
+            ..Default::default()
+        });
+        state.db.save_provider(&AppType::Dsh, &provider).unwrap();
+        for (id, dsh) in [("fetch", true), ("broken", dsh_enabled)] {
+            state
+                .db
+                .save_mcp_server(&McpServer {
+                    id: id.into(),
+                    name: id.into(),
+                    server: json!({"command":"node","args":["fetch.js"]}),
+                    apps: McpApps {
+                        dsh,
+                        claude: true,
+                        ..Default::default()
+                    },
+                    description: None,
+                    homepage: None,
+                    docs: None,
+                    tags: vec![],
+                })
+                .unwrap();
+        }
+        state
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mcp_servers SET server_config = '{\"command\":' WHERE id = 'broken'",
+                [],
+            )
+            .unwrap();
+        state
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_initialization_ignores_an_unreadable_mcp_row_of_another_app() {
+        use crate::services::provider::initialize_dsh_profiles;
+
+        let home = DshHome::new();
+        init_profiles(home.dir.path(), &["web"]);
+        let state = seed_rows_with_one_unreadable_mcp(false);
+
+        initialize_dsh_profiles(&state).expect("another app's bad row must not block DSH");
+
+        let web = profile_path("web");
+        assert!(get_providers_from(&web, &credentials_path())
+            .unwrap()
+            .contains_key("gateway"));
+        let text = read_text(&web).unwrap();
+        assert!(existing_mcp_entry(&text, "fetch").unwrap().is_some());
+        assert!(existing_mcp_entry(&text, "broken").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_initialization_defers_while_a_dsh_row_is_unreadable() {
+        use crate::app_config::AppType;
+        use crate::services::provider::initialize_dsh_profiles;
+
+        let home = DshHome::new();
+        init_profiles(home.dir.path(), &["web"]);
+        let web = profile_path("web");
+        let before = read_text(&web).unwrap();
+        let state = seed_rows_with_one_unreadable_mcp(true);
+
+        // Seeding is one-time: going ahead without the row would leave it out for good.
+        assert!(initialize_dsh_profiles(&state).is_err());
+        assert_eq!(read_text(&web).unwrap(), before);
+        assert!(has_uninitialized_profiles().unwrap());
+
+        // Once the bad row is gone, the deferred profile is seeded on the next attempt.
+        state.db.delete_mcp_server("broken").unwrap();
+        initialize_dsh_profiles(&state).unwrap();
+        assert!(existing_mcp_entry(&read_text(&web).unwrap(), "fetch")
+            .unwrap()
+            .is_some());
+        assert!(!has_uninitialized_profiles().unwrap());
+
+        // With nothing waiting, a bad DSH row no longer fails later syncs.
+        state
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE providers SET settings_config = '{\"providers\":' WHERE app_type = ?1 AND id = 'gateway'",
+                [AppType::Dsh.as_str()],
+            )
+            .unwrap();
+        initialize_dsh_profiles(&state).expect("no profile is waiting");
     }
 
     #[test]

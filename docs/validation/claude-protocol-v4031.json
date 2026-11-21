@@ -1,0 +1,54 @@
+{
+  "recorded_on": "2026-11-21",
+  "kind": "sanitized validation summary, not an automatically rerun CI report",
+  "baseline": {
+    "repository": "farion1231/cc-switch",
+    "tag": "v4.0.31",
+    "commit": "3c76d3bda670297dd8c27d7d9be9b18a4c9143f5"
+  },
+  "environment": {
+    "os": "Windows",
+    "codex_version": "0.171.0-alpha.13",
+    "rust_version": "1.100.0"
+  },
+  "native_tests": {
+    "passed": true,
+    "responses_to_anthropic_tests": 79,
+    "thinking_optimizer_tests": 12,
+    "total": 91
+  },
+  "local_protocol_validation": {
+    "passed": true,
+    "cases": 43,
+    "paid_model_requests": 0,
+    "models": [
+      "claude-fable-5-2",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "claude-haiku-5-5"
+    ],
+    "efforts": ["low", "medium", "high", "xhigh", "max"],
+    "haiku_adaptive_thinking": true,
+    "signed_reasoning_round_trip": true,
+    "invalid_history_rejected_before_upstream": true,
+    "real_codex_client_against_local_mock": {
+      "tools": true,
+      "images": true,
+      "compaction_and_continuation": true
+    }
+  },
+  "desktop_production_build": {
+    "passed": true,
+    "custom_protocol_enabled": true,
+    "frontend_embedded": true,
+    "window_visually_verified": true,
+    "dev_server_required": false,
+    "verified_exe_sha256": "de709676044be6b87d57b518f68eb9aff9d888c78412b012d06308ea74b123fd"
+  },
+  "not_established_by_local_validation": [
+    "A relay customer's current credential validity",
+    "Live upstream prompt-cache hits or actual billing",
+    "Million-token production compaction performance",
+    "Strict JSON Schema preservation"
+  ]
+}

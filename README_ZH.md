@@ -1,3 +1,6 @@
+> 本个人分支包含基于 v4.0.31 的 Claude 协议修复。
+> 请先阅读[分支说明](FORK.md)和 [Codex + Sub2API 完整接入文档](docs/guides/codex-sub2api-production-zh.md)。
+
 <div align="center">
 
 # CC Switch

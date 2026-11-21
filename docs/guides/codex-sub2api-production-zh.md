@@ -18,9 +18,11 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
+| 压缩的 SSE 响应 | 在事件转换前增量解压 gzip、deflate（zlib）、br、zstd 及堆叠编码；不等待整条流结束 |
+| 私有 CA 站点 | 可在本机按 HTTPS origin 固定证书 SHA256；仍检查域名、有效期及 TLS 握手签名，拒绝重定向 |
 | 鉴权、真实缓存、图片、工具续接、摘要后继续 | 旧修复版曾通过 Sonnet 小额实网验收；本次升级只执行不计费的本地回归，其他部署按第 7 节验收 |
 
-本次升级已通过 1983 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
+本次升级已通过 1989 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
 模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
 此前 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
@@ -30,7 +32,7 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.1/CC-Switch-4.0.38-Claude-Fix.1-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.2/CC-Switch-4.0.38-Claude-Fix.2-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
@@ -136,6 +138,55 @@ Clash 必须绕过 `127.0.0.0/8`、`localhost` 和 `::1`，使 Codex 到 CCS 的
 `stream_idle_timeout_ms` 设为 300000。
 请求出错后由使用者决定是否重试；该配置不提供自动恢复。
 如果多个模型共享这个 provider，传输及重试设置也会共同生效。
+
+### 私有 CA 的 HTTPS 站点
+
+有些自建站使用私有 CA，浏览器能打开不代表 CC Switch 信任其证书。
+优先由站点配置公开可信证书，或通过可信渠道取得真实根 CA。
+当站点只能提供私有证书、使用者明确接受首次连接的信任风险时，本修复版支持固定叶证书指纹。
+它仅替代该站的 CA 链验证；证书指纹、主机名、有效期和 TLS 握手签名仍须通过检查。
+
+在 CC Switch 配置目录创建 `tls-pins.json`。Windows 默认位置为
+`%USERPROFILE%\.cc-switch\tls-pins.json`；使用自定义数据目录时放在同一数据库目录下。
+内容是 HTTPS origin 到证书 SHA256 的 JSON 对象：
+
+```json
+{
+  "https://gateway.example.com:21137": "替换为64位十六进制证书SHA256"
+}
+```
+
+键只包含协议、域名和端口，不包含 `/v1`、路径或末尾斜杠。
+证书指纹由站点管理员通过可信渠道提供最佳；若自行首次获取，必须清楚这次获取尚未经过 CA 验证。
+指纹是完整 DER 叶证书的 SHA256，不是公钥指纹，也不是 SHA1。
+请将示例值替换为实际 64 位十六进制指纹后保存；推荐 UTF-8 无 BOM。
+这个文件不含 API Key，不随安装包分发，不导入 Windows 根证书库。
+
+如需查看当前证书，可在 PowerShell 中执行以下只建立 TLS、不提交 API Key 的代码。
+`$relayHost` 与 `$relayPort` 填写自己的站点；检查输出后再将指纹写入文件。
+
+```powershell
+$relayHost = "gateway.example.com"
+$relayPort = 21137
+$tcp = [Net.Sockets.TcpClient]::new($relayHost, $relayPort)
+$tls = [Net.Security.SslStream]::new($tcp.GetStream(), $false, { $true })
+try {
+    $tls.AuthenticateAsClient($relayHost)
+    $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($tls.RemoteCertificate)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $fingerprint = ([BitConverter]::ToString($sha.ComputeHash($cert.RawData))).Replace("-", "").ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    $cert | Format-List Subject, Issuer, NotBefore, NotAfter
+    "SHA256: $fingerprint"
+} finally { $tls.Dispose(); $tcp.Dispose() }
+```
+
+配置后先手动查询一次额度，确认成功，再开始工作。新请求会重新读取指纹文件，
+连接池按 origin、指纹和出站代理分别复用；其他域名、子域名和端口继续使用正常 CA 验证。
+固定证书的请求禁止 HTTP 重定向，避免凭据被转发到未核验入口。
+证书更新后旧指纹会拒绝连接，取得新证书并核对后更新本机文件。
+本方案不能代替服务端自动续期证书；分发 MSI 时让每位使用者配置自己的站点与凭据。
 
 ## 4. 模型目录、上下文与图片
 
@@ -332,6 +383,9 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 接口未提供计费单位时显示“额度”，不要擅自当成美元。
 5h/7d 是滚动窗口，不等于“每日/每月美元限额”；不要互相代填。
 价格表按自己商家的当前输入、输出、缓存读写单价填写。
+迁移网关时保留实际模型 ID，例如 `claude-fable-5-2`，不要为了兼容把它映射成 Opus。
+模型列表只证明入口存在；额度 GET 不会产生新的 Fable 消费记录，不能据此证明其扣费单价。
+需要核对价格时查看站点后台的模型定价、分组倍率和已有账单，不通过大请求试扣费。
 本地看板与查询脚本负责显示；需要硬性停止扣费时配置商家服务端额度上限。
 
 ## 7. 正式使用前的最小验收
@@ -366,6 +420,8 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 | 502：connection closed / TLS EOF / 连接被重置 | 查看供应商和实际出站错误；CCS 出站代理留空，在 Clash 核对 TUN、DNS、规则及节点状态。本机 /responses 是客户端入口 |
 | 只缓存很小的固定前缀 | 查看实际 Messages 断点、TTL、会话路由和回传统计 |
 | 流中断、输出突然结束 | 核对内部 status/incomplete_details；不能只看 response.completed 事件名 |
+| gzip SSE 出现乱码或没有终止事件 | 使用修复版 2；压缩字节须先解码再交给事件改写器，单纯删掉 Content-Encoding 会损坏响应 |
+| 私有 CA / unknown issuer / certificate verify failed | 按第 3 节配置可信 CA 或本机证书指纹；证书更新后核对新指纹 |
 | strict JSON Schema | 当前转换会丢弃对应请求字段，不按严格结构化输出能力使用 |
 | Codex 内置 web_search | Anthropic 路径不提供该原生工具，需要另行配置受支持的搜索工具 |
 | 原生图片 detail=original | 不做等价保证；使用普通图片输入 |
@@ -378,8 +434,16 @@ CC Switch 的全局出站代理会同时影响 GPT 和 Claude，本方案将它�
 检查 502 时先记录错误时间，区分 Connect 建连超时、SendRequest 发送时断连和 SSE 流中断，
 再对齐 Clash 的内核日志与连接记录。重启恢复能说明链路状态发生改变，但不能单独确定
 具体是节点、TUN、DNS 还是连接状态异常。短请求正常不能代替长请求或 SSE 验证。
-本次 Claude 补丁没有修改共享 forwarder、连接池或 HTTP 客户端；上游版本升级包含自身变化。
+早前的 Claude 工具和推理补丁只改转换层。本次修复版 2 增加了 Responses 分派前的
+流式解压，以及显式固定证书站点的客户端选择；未配置该站指纹时继续使用原有客户端。
+CCS 出站代理保持原设置，不用修改连接池重试参数处理证书错误。
 请求发送后断连时上游可能已经开始处理，不用提高自动重试次数掩盖错误。
+
+一次现场调查确认过 Clash 界面期望 TUN 开启，但实际内核未启用；仅切换开关后又出现
+169.254 地址且缺少默认路由。重新加载完整配置后恢复预期虚拟网卡地址、路由和 DNS。
+因此重启内核恢复时，应同时核对实际内核配置及网卡路由，而不只看界面的开关。
+另一个出口曾在 TLS 握手阶段返回 EOF，调整该目标的 Clash 规则后恢复。
+这些现场结果与本地复现的 gzip SSE 问题分别处理；没有证据把所有断流归于同一原因。
 
 顶层组合 schema 兼容层只作用于 Codex 到 Anthropic 的工具转换。
 它将原始 schema 放在必填 `_ccs_input` 属性中，返回时拆除这一层，历史回放时再添加；
@@ -395,6 +459,12 @@ CC Switch 的全局出站代理会同时影响 GPT 和 Claude，本方案将它�
 - `src-tauri/src/proxy/providers/transform_codex_anthropic.rs`
 - `src-tauri/src/proxy/providers/streaming_codex_anthropic.rs`
 - `src-tauri/src/proxy/thinking_optimizer.rs`
+- `src-tauri/src/proxy/content_encoding.rs` 和 `handlers.rs` 中的 SSE 解码入口
+- `src-tauri/src/proxy/tls_pins.rs`、`forwarder/send.rs`、`http_client.rs` 和 `src-tauri/src/usage_script.rs` 中的按站点证书支持
+- `src-tauri/Cargo.toml`、`Cargo.lock` 中对应的解码与证书解析依赖
+
+升级前备份配置目录中的 `tls-pins.json`，在新安装上先查询额度。最终只保留一个正式安装目录、
+一个运行实例，并让所有快捷方式指向该目录。不要让旧便携版和新安装版同时竞争本机 15721 端口。
 
 原生回归命令（不调用模型；测试目录使用一次性路径）：
 

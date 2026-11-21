@@ -52,6 +52,10 @@ futures = "0.3"
 rmcp = { version = "0.8.5", features = ["client", "transport-async-rw", "transport-sse-client-reqwest", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "8.2", features = ["tokio1"] }
 async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
+tokio-util = { version = "0.7", features = ["io"] }
+x509-parser = "0.18"
+webpki = { package = "rustls-webpki", version = "0.103" }
 bytes = "1.5"
 prost = "0.14"
 axum = "0.7"
@@ -147,6 +151,7 @@ panic = "unwind"
 strip = "symbols"
 
 [dev-dependencies]
+rcgen = "0.13"
 serial_test = "3"
 tempfile = "3"
 tauri = { version = "2.8.2", features = ["test"] }

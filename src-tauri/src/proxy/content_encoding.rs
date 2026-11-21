@@ -7,6 +7,68 @@
 use axum::http::header::HeaderMap;
 use std::io::Read;
 
+/// Normalize successful compressed SSE before event transforms. Keep the plain
+/// path untouched; decoding is incremental so first-token latency and timeout
+/// handling do not depend on upstream EOF.
+pub(crate) fn decode_sse_response(
+    response: super::hyper_client::ProxyResponse,
+) -> Result<super::hyper_client::ProxyResponse, super::ProxyError> {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
+    use futures::{Stream, StreamExt};
+    use std::pin::Pin;
+    use tokio::io::BufReader;
+    use tokio_util::io::{ReaderStream, StreamReader};
+
+    if !response.status().is_success() || !response.is_sse() {
+        return Ok(response);
+    }
+    let Some(encoding) = get_content_encoding(response.headers()) else {
+        return Ok(response);
+    };
+    if !is_supported_content_encoding(&encoding) {
+        return Err(super::ProxyError::ForwardFailed(format!(
+            "Unsupported SSE content-encoding: {encoding}"
+        )));
+    }
+
+    type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+    let status = response.status();
+    let mut headers = response.headers().clone();
+    let mut stream: ByteStream = Box::pin(response.bytes_stream());
+    for coding in split_codings(&encoding).into_iter().rev() {
+        let reader = BufReader::new(StreamReader::new(stream));
+        let decoded: Pin<Box<dyn tokio::io::AsyncRead + Send>> = match coding {
+            "gzip" | "x-gzip" => {
+                let mut decoder = GzipDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::pin(decoder)
+            }
+            "deflate" => Box::pin(ZlibDecoder::new(reader)),
+            "br" => Box::pin(BrotliDecoder::new(reader)),
+            "zstd" | "zst" => Box::pin(ZstdDecoder::new(reader)),
+            _ => unreachable!("validated content-encoding"),
+        };
+        let mut decoded = ReaderStream::new(decoded);
+        // Bound each layer, including intermediate stacked encodings. Emit
+        // errors rather than feeding corrupt/truncated compressed bytes to SSE.
+        stream = Box::pin(async_stream::try_stream! {
+            let mut total = 0usize;
+            while let Some(chunk) = decoded.next().await {
+                let chunk = chunk?;
+                total = total.saturating_add(chunk.len());
+                if total > super::hyper_client::MAX_RESPONSE_BODY_BYTES {
+                    Err(std::io::Error::other("decompressed SSE exceeds response body limit"))?;
+                }
+                yield chunk;
+            }
+        });
+    }
+    super::response_processor::strip_entity_headers_for_rebuilt_body(&mut headers);
+    Ok(super::hyper_client::ProxyResponse::streamed(
+        status, headers, stream,
+    ))
+}
+
 /// 把 content-encoding 值拆成有序 coding 列表（去掉 identity 与空值）。
 ///
 /// HTTP 允许堆叠编码（如 `gzip, zstd`），各 coding 以逗号分隔；亦允许重复
@@ -200,6 +262,138 @@ pub(crate) fn get_content_encoding(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn sse_response(encoding: &str, body: Vec<u8>) -> super::super::hyper_client::ProxyResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("content-encoding", encoding.parse().unwrap());
+        headers.insert("content-length", body.len().into());
+        super::super::hyper_client::ProxyResponse::buffered(
+            http::StatusCode::OK,
+            headers,
+            body.into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn compressed_sse_decodes_all_standard_encodings_and_stacks() {
+        use std::io::Write;
+        let payload = "event: response.completed\ndata: {\"text\":\"图片与工具 ✓\"}\n\n".as_bytes();
+        let gzip = gzip_compress(payload);
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(payload).unwrap();
+        let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        br.write_all(payload).unwrap();
+        br.flush().unwrap();
+        let br = br.into_inner();
+        let zstd = zstd::stream::encode_all(payload, 0).unwrap();
+        let stacked = zstd::stream::encode_all(gzip.as_slice(), 0).unwrap();
+        let mut multi = gzip.clone();
+        multi.extend_from_slice(&gzip);
+        for (encoding, data, expected) in [
+            ("gzip", gzip.clone(), payload.to_vec()),
+            ("x-gzip", gzip, payload.to_vec()),
+            ("deflate", zlib.finish().unwrap(), payload.to_vec()),
+            ("br", br, payload.to_vec()),
+            ("zstd", zstd, payload.to_vec()),
+            ("gzip, zstd", stacked, payload.to_vec()),
+            ("gzip", multi, payload.repeat(2)),
+        ] {
+            let response = sse_response(encoding, data);
+            let (status, headers, data) = match response {
+                super::super::hyper_client::ProxyResponse::Buffered {
+                    status,
+                    headers,
+                    body,
+                } => (status, headers, body),
+                _ => unreachable!(),
+            };
+            // Split in the middle of codec headers, trailers and UTF-8 codepoints.
+            let chunks: Vec<_> = data
+                .chunks(3)
+                .map(|b| Ok(bytes::Bytes::copy_from_slice(b)))
+                .collect();
+            let response = super::super::hyper_client::ProxyResponse::streamed(
+                status,
+                headers,
+                futures::stream::iter(chunks),
+            );
+            let decoded = decode_sse_response(response).unwrap();
+            assert!(!decoded.headers().contains_key("content-encoding"));
+            assert!(!decoded.headers().contains_key("content-length"));
+            assert_eq!(
+                decoded.bytes_with_limit(4096).await.unwrap().as_ref(),
+                expected,
+                "{encoding}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gzip_sse_emits_before_upstream_eof() {
+        use futures::StreamExt;
+        use std::io::Write;
+        let payload = b"data: {\"type\":\"response.created\"}\n\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.flush().unwrap();
+        let data = encoder.get_ref().clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        let stream = futures::stream::once(async move { Ok(bytes::Bytes::from(data)) })
+            .chain(futures::stream::pending());
+        let response = super::super::hyper_client::ProxyResponse::streamed(
+            http::StatusCode::OK,
+            headers,
+            stream,
+        );
+        let mut stream = decode_sse_response(response).unwrap().bytes_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn compressed_sse_rejects_corrupt_truncated_and_unknown_codings() {
+        let mut truncated = gzip_compress(b"data: {}\n\n");
+        truncated.truncate(truncated.len() - 5);
+        for body in [vec![0, 1, 2, 3], truncated] {
+            assert!(decode_sse_response(sse_response("gzip", body))
+                .unwrap()
+                .bytes_with_limit(4096)
+                .await
+                .is_err());
+        }
+        assert!(decode_sse_response(sse_response("snappy", vec![1, 2])).is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_decoder_preserves_error_bodies_and_non_sse() {
+        for (status, content_type) in [
+            (http::StatusCode::BAD_REQUEST, "text/event-stream"),
+            (http::StatusCode::OK, "application/json"),
+        ] {
+            let data = gzip_compress(b"{\"error\":\"preserve\"}");
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", content_type.parse().unwrap());
+            headers.insert("content-encoding", "gzip".parse().unwrap());
+            let original = super::super::hyper_client::ProxyResponse::buffered(
+                status,
+                headers,
+                data.clone().into(),
+            );
+            let response = decode_sse_response(original).unwrap();
+            assert_eq!(response.headers()["content-encoding"], "gzip");
+            assert_eq!(
+                response.bytes_with_limit(4096).await.unwrap().as_ref(),
+                data
+            );
+        }
+    }
 
     #[test]
     fn decompress_body_deflate_handles_zlib_wrapped_per_rfc9110() {

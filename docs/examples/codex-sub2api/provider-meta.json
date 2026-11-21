@@ -1,7 +1,0 @@
-{
-  "commonConfigEnabled": false,
-  "apiFormat": "anthropic",
-  "apiKeyField": "ANTHROPIC_AUTH_TOKEN",
-  "impersonateClaudeCode": false,
-  "maxOutputTokens": 16384
-}

@@ -15,13 +15,12 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
-| 本次部署的鉴权、真实缓存、图片、工具续接、摘要后继续 | 实网小额验收通过，见独立验收记录；其他部署按第 7 节验收 |
+| 本次部署的鉴权、真实缓存、图片、工具续接、摘要后继续 | 实网小额验收通过；其他部署按第 7 节验收 |
 
-首次 91 项原生测试和 43 项本地协议检查的记录见
-[验证摘要](../validation/claude-protocol-v4031.json)。模拟缓存计数只能证明用量转换，
-不能证明付费上游真的缓存了输入。此前“原生 Codex 永远不能命中缓存”的说法不成立。
-后续 adaptive 工具续接修复已有 92 项原生回归通过；
-真实缓存和功能验收另见[实网验收记录](../validation/claude-live-acceptance-2026-11-21.md)。
+本分支已通过 92 项原生回归测试。模拟缓存计数只能证明用量转换，
+不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
+本次 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
+没有完成百万 token 压缩性能验收。
 
 ## 2. 获取并构建修复版
 
@@ -70,11 +69,46 @@ Codex 的生效地址应为 `http://127.0.0.1:15721/v1`，协议仍是
 `wire_api = "responses"`；商家地址保留在 CC Switch 的上游供应商配置中。
 不要把 Messages 地址直接当成 Codex 的 Responses 地址。
 
-供应商 TOML 参考 [provider.toml](../examples/codex-sub2api/provider.toml)。
-它是 CC Switch 的上游配置示例，**不是接管后直接覆盖 Codex 主配置的文件**。
-真实 Key 由本机供应商凭据提供，示例中没有密钥。
-元数据字段参考 [provider-meta.json](../examples/codex-sub2api/provider-meta.json)；
-这是字段片段，不是整库备份或一键导入文件。
+以下是 CC Switch 的上游供应商配置示例，**不是接管后直接覆盖 Codex 主配置的文件**。
+替换示例地址，在本机供应商凭据中填写自己的 Key。
+
+```toml
+# CC Switch upstream provider template, not the live Codex proxy configuration.
+# Replace the example URL; enter the real key in CC Switch's credential field.
+model_provider = "claude_gateway"
+model = "claude-sonnet-5-5"
+model_reasoning_effort = "medium"
+model_context_window = 1000000
+model_auto_compact_token_limit = 800000
+model_auto_compact_token_limit_scope = "body_after_prefix"
+tool_output_token_limit = 12000
+
+[model_providers.claude_gateway]
+name = "Claude Gateway"
+base_url = "https://gateway.example.com/v1"
+env_key = "CLAUDE_GATEWAY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 300000
+
+[model_providers.claude_gateway.capabilities]
+remote_compaction = "unsupported"
+```
+
+对应元数据字段如下；这是字段片段，不是整库备份或一键导入文件。
+
+```json
+{
+  "commonConfigEnabled": false,
+  "apiFormat": "anthropic",
+  "apiKeyField": "ANTHROPIC_AUTH_TOKEN",
+  "impersonateClaudeCode": false,
+  "maxOutputTokens": 16384
+}
+```
 
 关闭本地路由的自动故障转移。本文采用 HTTP SSE，
 将 provider 的 `supports_websockets` 设为 false，
@@ -97,9 +131,27 @@ Codex 的生效地址应为 `http://127.0.0.1:15721/v1`，协议仍是
 | claude-haiku-5-5 | medium | 1000000 | 16384 |
 
 在供应商模型映射中逐项填写模型 ID、上下文窗口和五档推理。
-[model-catalog-settings.json](../examples/codex-sub2api/model-catalog-settings.json)
-对应供应商 `settingsConfig.modelCatalog` 的字段示例，不是 Codex 原始 catalog。
+下面以 Sonnet 为例，字段属于供应商 `settingsConfig.modelCatalog`，不是 Codex 原始 catalog。
+其余三个模型使用上表对应的模型 ID，分别添加同样的窗口、模态和推理档位设置。
 已有供应商仅合并这一字段，不覆盖 auth、config 或其他模型。
+
+```json
+{
+  "modelCatalog": {
+    "models": [
+      {
+        "model": "claude-sonnet-5-5",
+        "displayName": "Claude Sonnet 5.5",
+        "contextWindow": 1000000,
+        "inputModalities": ["text", "image"],
+        "supportsParallelToolCalls": false,
+        "reasoningLevels": ["low", "medium", "high", "xhigh", "max"],
+        "defaultReasoningLevel": "medium"
+      }
+    ]
+  }
+}
+```
 CC Switch 生成的实际 catalog 至少核对：
 
 - `input_modalities = ["text", "image"]`。
@@ -179,10 +231,80 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 密钥从供应商配置取，不复制到脚本中。
 
 - 只有余额/总额度时，可先选内置 Sub2API 模板。
-- 需要显示 `rate_limits` 中 5h/7d 多窗口时，选自定义，粘贴
-  [usage-query.js](../examples/codex-sub2api/usage-query.js)。
+- 需要显示 `rate_limits` 中 5h/7d 多窗口时，选自定义，粘贴下方脚本。
 - 超时设 15 秒，自动查询间隔设 5 分钟；先手动运行一次核对字段与单位。
 - total、used、remaining、reset_at 从接口读取，不把某个账户的额度写死给其他人。
+
+```javascript
+// Paste this expression into CC Switch's custom usage-query editor.
+// Credentials are substituted by CC Switch; do not hard-code them here.
+({
+  request: {
+    url:
+      "{{baseUrl}}".replace(/\/+$/, "").replace(/\/v1$/, "") + "/v1/usage",
+    method: "GET",
+    headers: {
+      Authorization: "Bearer {{apiKey}}",
+      "User-Agent": "cc-switch/1.0",
+    },
+  },
+  extractor: function (response) {
+    var invalid = function (message) {
+      return { isValid: false, invalidMessage: String(message) };
+    };
+    var finite = function (value) {
+      return typeof value === "number" && isFinite(value) && value >= 0;
+    };
+    if (!response || typeof response !== "object") {
+      return invalid("额度接口未返回对象");
+    }
+    if (response.isValid === false || response.error) {
+      return invalid(response.status || response.message || "额度查询失败");
+    }
+    var quota = response.quota || {};
+    var unit = response.unit || quota.unit || "额度";
+    if (Array.isArray(response.rate_limits) && response.rate_limits.length) {
+      var windows = response.rate_limits.map(function (window) {
+        if (!window || typeof window !== "object") {
+          return invalid("额度窗口格式不正确");
+        }
+        if (
+          !finite(window.limit) &&
+          !finite(window.used) &&
+          !finite(window.remaining)
+        ) {
+          return invalid("额度窗口缺少有效数值");
+        }
+        var names = { "5h": "5小时额度", "7d": "7天额度" };
+        var result = {
+          isValid: true,
+          planName: names[window.window] || String(window.window || "自定义") + "额度",
+          unit: unit,
+          extra: "重置：" + String(window.reset_at || "服务端未提供"),
+        };
+        if (finite(window.limit)) result.total = window.limit;
+        if (finite(window.used)) result.used = window.used;
+        if (finite(window.remaining)) result.remaining = window.remaining;
+        return result;
+      });
+      return windows;
+    }
+    var result = { isValid: true, unit: unit };
+    if (typeof response.planName === "string") result.planName = response.planName;
+    if (finite(response.remaining)) result.remaining = response.remaining;
+    if (finite(quota.limit)) result.total = quota.limit;
+    if (finite(quota.used)) result.used = quota.used;
+    if (
+      result.remaining === undefined &&
+      result.total === undefined &&
+      result.used === undefined
+    ) {
+      return invalid("额度接口格式不匹配，请按商家实际响应调整提取器");
+    }
+    return result;
+  },
+})
+```
 
 示例提取器兼容多窗口和普通余额响应；遇到未知格式报错，不显示虚构余额。
 接口未提供计费单位时显示“额度”，不要擅自当成美元。

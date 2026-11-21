@@ -1,6 +1,3 @@
-> This personal fork includes a Claude protocol fix based on v4.0.31.
-> See [fork notes](FORK.md) and the [Codex + Sub2API setup guide (中文)](docs/guides/codex-sub2api-production-zh.md).
-
 <div align="center">
 
 # CC Switch

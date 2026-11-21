@@ -11,15 +11,17 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | Fable 5.2、Opus 5.5、Sonnet 5.5、Haiku 5.5 | 保留全部入口，五档推理原样转换，默认 medium |
 | xhigh | 支持的型号保留 xhigh；旧型号保留原有 max 回退 |
 | Haiku 5.5 | 使用 adaptive thinking，不再发送旧式 budget_tokens |
-| 强制思考型号、必要签名缺失 | 阻止非法 disabled 请求；无法合法恢复的历史在本地报错 |
+| Adaptive 工具续接 | 模型未输出思考块时仍允许回传合法工具结果；已有签名块原样保留 |
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
-| 真实账户鉴权、真实缓存收益 | 每个部署环境单独验收，见第 7 节 |
+| 本次部署的鉴权、真实缓存、图片、工具续接、摘要后继续 | 实网小额验收通过，见独立验收记录；其他部署按第 7 节验收 |
 
-91 项原生测试和 43 项本地协议检查的记录见
+首次 91 项原生测试和 43 项本地协议检查的记录见
 [验证摘要](../validation/claude-protocol-v4031.json)。模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。此前“原生 Codex 永远不能命中缓存”的说法不成立。
+后续 adaptive 工具续接修复已有 92 项原生回归通过；
+真实缓存和功能验收另见[实网验收记录](../validation/claude-live-acceptance-2026-11-21.md)。
 
 ## 2. 获取并构建修复版
 
@@ -117,8 +119,10 @@ CC Switch 生成的实际 catalog 至少核对：
 这仍可能调用模型生成摘要并计费，不意味着离线或免费压缩。
 `body_after_prefix` 控制门槛计数范围，不代表删除历史或免除输入费用。
 
-完全退出并重新启动 Codex，再新建同一模型的对话。不要把旧协议、其他模型或缺失
-thinking 签名的半截工具历史混入新会话。实际附加 PNG/JPEG/WebP 等有效图片；
+完全退出并重新启动 Codex，再新建同一模型的对话。不要把旧协议、其他模型或损坏的
+半截工具历史混入新会话。Adaptive thinking 有时不输出思考块，这不属于签名损坏，
+合法的工具结果可以直接继续回传；若产生了签名块，则需原样保留。
+实际附加 PNG/JPEG/WebP 等有效图片；
 仅发送本机文件路径不等于上传图片。让模型描述图中一个明确细节作为看图验收。
 
 ## 5. 为什么以前缓存少，正确请求是什么
@@ -250,6 +254,7 @@ Remove-Item Env:CC_SWITCH_TEST_HOME
 
 - [Anthropic 模型概览](https://platform.claude.com/docs/en/about-claude/models/overview)
 - [Anthropic Effort](https://platform.claude.com/docs/en/build-with-claude/effort)
+- [Anthropic Adaptive Thinking](https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking)
 - [Anthropic Prompt Caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - [Anthropic Vision](https://platform.claude.com/docs/en/build-with-claude/vision)
 - [Codex 配置参考](https://developers.openai.com/codex/config-reference/)

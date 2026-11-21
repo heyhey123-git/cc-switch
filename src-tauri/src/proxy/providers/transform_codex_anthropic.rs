@@ -307,13 +307,13 @@ pub fn responses_request_to_anthropic(
             "cannot convert Codex request: empty messages".to_string(),
         ));
     }
-    let thinking_history_is_valid = trailing_turn_supports_thinking(&messages);
+    let adaptive_model = crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
+    let thinking_history_is_valid = trailing_turn_supports_thinking(&messages, adaptive_model);
     result["messages"] = json!(messages);
 
     let reasoning_effort = body
         .pointer("/reasoning/effort")
         .and_then(|value| value.as_str());
-    let adaptive_model = crate::proxy::thinking_optimizer::uses_adaptive_thinking(model);
     let adaptive_by_default = crate::proxy::thinking_optimizer::adaptive_thinking_is_default(model);
     let normalized_model = model.to_ascii_lowercase().replace(['.', '_'], "-");
     let haiku_highest_effort = normalized_model.contains("haiku-5-5")
@@ -342,8 +342,7 @@ pub fn responses_request_to_anthropic(
     if !thinking_history_is_valid {
         if cannot_disable_thinking {
             return Err(ProxyError::InvalidRequest(
-                "Anthropic model requires thinking, but the tool history has no signed thinking block to replay"
-                    .to_string(),
+                "Anthropic tool results do not match the preceding assistant tool turn".to_string(),
             ));
         }
         if adaptive_should_think {
@@ -1051,10 +1050,10 @@ fn message_has_content(message: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// A fresh user prompt can start a new thinking turn. A tool-result continuation
-/// may keep thinking enabled only when the preceding assistant turn includes the
-/// signed thinking/redacted-thinking block that Anthropic requires callers to replay.
-fn trailing_turn_supports_thinking(messages: &[Value]) -> bool {
+/// A fresh user prompt can start a new thinking turn. Manual thinking requires
+/// replaying the preceding signed block. Adaptive thinking can legitimately emit
+/// only tool_use, so that continuation must not invent or require a thinking block.
+fn trailing_turn_supports_thinking(messages: &[Value], adaptive_thinking: bool) -> bool {
     let Some(last) = messages.last() else {
         return false;
     };
@@ -1099,7 +1098,7 @@ fn trailing_turn_supports_thinking(messages: &[Value]) -> bool {
             Some("thinking" | "redacted_thinking")
         )
     });
-    if !has_signed_thinking {
+    if !has_signed_thinking && !adaptive_thinking {
         return false;
     }
 
@@ -2270,8 +2269,13 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_thinking_models_reject_unsigned_tool_history_locally() {
-        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+    fn adaptive_models_continue_tool_history_without_inventing_thinking() {
+        for model in [
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
             let result = responses_request_to_anthropic(
                 json!({
                     "model": model, "reasoning":{"effort":"xhigh"},
@@ -2283,9 +2287,14 @@ mod tests {
                 }),
                 16384,
             );
-            assert!(
-                result.is_err(),
-                "{model} must not receive invalid disabled thinking"
+            let result = result.unwrap();
+            assert_eq!(result["thinking"]["type"], "adaptive", "{model}");
+            assert_eq!(result["output_config"]["effort"], "xhigh", "{model}");
+            assert_eq!(result["messages"][1]["content"][0]["type"], "tool_use");
+            assert_eq!(result["messages"][2]["content"][0]["type"], "tool_result");
+            assert_eq!(
+                result["messages"][1]["content"].as_array().unwrap().len(),
+                1
             );
         }
     }
@@ -2336,7 +2345,7 @@ mod tests {
         }))
         .unwrap();
         let input = json!({
-            "model": "claude-sonnet-5",
+            "model": "claude-sonnet-4-5",
             "max_output_tokens": 4096,
             "reasoning": { "effort": "high" },
             "input": [
@@ -2351,7 +2360,7 @@ mod tests {
 
         let result = responses_request_to_anthropic(input, 4096).unwrap();
 
-        assert_eq!(result["thinking"]["type"], "disabled");
+        assert!(result.get("thinking").is_none());
         let messages = result["messages"].as_array().unwrap();
         let paired_assistant = &messages[messages.len() - 2];
         assert_eq!(paired_assistant["role"], "assistant");
@@ -2371,7 +2380,10 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "c2", "content": "two"}
             ]}
         ]);
-        assert!(trailing_turn_supports_thinking(paired.as_array().unwrap()));
+        assert!(trailing_turn_supports_thinking(
+            paired.as_array().unwrap(),
+            false
+        ));
 
         let mismatched = json!([
             paired[0].clone(),
@@ -2381,8 +2393,46 @@ mod tests {
             ]}
         ]);
         assert!(!trailing_turn_supports_thinking(
-            mismatched.as_array().unwrap()
+            mismatched.as_array().unwrap(),
+            false
         ));
+        assert!(!trailing_turn_supports_thinking(
+            mismatched.as_array().unwrap(),
+            true
+        ));
+    }
+
+    #[test]
+    fn adaptive_tool_turn_can_skip_thinking_after_an_earlier_signed_turn() {
+        let encrypted = encode_anthropic_thinking_block(&json!({
+            "type": "thinking",
+            "thinking": "previous reasoning",
+            "signature": "sig_previous"
+        }))
+        .unwrap();
+        let result = responses_request_to_anthropic(
+            json!({
+                "model": "claude-sonnet-5-5",
+                "reasoning": { "effort": "medium" },
+                "input": [
+                    { "role": "user", "content": "first question" },
+                    { "type": "reasoning", "encrypted_content": encrypted },
+                    { "role": "assistant", "content": "first answer" },
+                    { "role": "user", "content": "call the tool" },
+                    { "type": "function_call", "call_id": "c2", "name": "read", "arguments": "{}" },
+                    { "type": "function_call_output", "call_id": "c2", "output": "result" }
+                ]
+            }),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(result["thinking"]["type"], "adaptive");
+        assert_eq!(result["output_config"]["effort"], "medium");
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"][0]["signature"], "sig_previous");
+        let paired = &messages[messages.len() - 2]["content"];
+        assert_eq!(paired.as_array().unwrap().len(), 1);
+        assert_eq!(paired[0]["type"], "tool_use");
     }
 
     #[test]

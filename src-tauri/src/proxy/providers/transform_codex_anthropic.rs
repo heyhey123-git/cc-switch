@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const ANTHROPIC_THINKING_ENCRYPTED_PREFIX: &str = "ccswitch-anthropic-thinking-v1:";
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
+const ANTHROPIC_TOOL_INPUT_FIELD: &str = "_ccs_input";
 
 /// Anthropic `max_tokens` used when neither the request nor the provider sets an
 /// output ceiling. Codex never sends `max_output_tokens`, so in practice this is
@@ -480,6 +481,15 @@ fn chat_tool_to_anthropic_tool(chat_tool: &Value) -> Option<Value> {
             schema.insert("type".to_string(), json!("object"));
         }
     }
+    if schema_needs_anthropic_input_wrapper(&input_schema) {
+        rebase_wrapped_schema_refs(&mut input_schema);
+        input_schema = json!({
+            "type": "object",
+            "properties": { ANTHROPIC_TOOL_INPUT_FIELD: input_schema },
+            "required": [ANTHROPIC_TOOL_INPUT_FIELD],
+            "additionalProperties": false
+        });
+    }
     let mut tool = json!({ "name": name, "input_schema": input_schema });
     if let Some(description) = function.get("description").and_then(|value| value.as_str()) {
         tool["description"] = json!(description);
@@ -488,6 +498,122 @@ fn chat_tool_to_anthropic_tool(chat_tool: &Value) -> Option<Value> {
         tool["strict"] = json!(strict);
     }
     Some(tool)
+}
+
+fn schema_needs_anthropic_input_wrapper(schema: &Value) -> bool {
+    ["oneOf", "allOf", "anyOf", "$ref"]
+        .iter()
+        .any(|keyword| schema.get(keyword).is_some())
+}
+
+pub(crate) fn tool_needs_anthropic_input_wrapper(
+    name: &str,
+    tool_context: &CodexToolContext,
+) -> bool {
+    tool_context.chat_tools().iter().any(|tool| {
+        tool.pointer("/function/name").and_then(Value::as_str) == Some(name)
+            && tool
+                .pointer("/function/parameters")
+                .is_some_and(schema_needs_anthropic_input_wrapper)
+    })
+}
+
+/// Moving the original schema beneath a property must also move JSON-pointer
+/// references to that schema. Only visit schema positions, never const/default
+/// instance data. An explicit $id establishes a separate resource boundary.
+fn rebase_wrapped_schema_refs(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.get("$id").and_then(Value::as_str).is_some() {
+        return;
+    }
+    for keyword in ["$ref", "$recursiveRef", "$dynamicRef"] {
+        if let Some(reference) = object.get_mut(keyword) {
+            if let Some(value) = reference.as_str() {
+                if value == "#" || value.starts_with("#/") {
+                    *reference = json!(format!(
+                        "#/properties/{ANTHROPIC_TOOL_INPUT_FIELD}{}",
+                        &value[1..]
+                    ));
+                }
+            }
+        }
+    }
+    for keyword in [
+        "$defs",
+        "definitions",
+        "properties",
+        "patternProperties",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                rebase_wrapped_schema_refs(child);
+            }
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                rebase_wrapped_schema_refs(child);
+            }
+        }
+    }
+    for keyword in [
+        "items",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "additionalItems",
+        "unevaluatedItems",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if let Some(child) = object.get_mut(keyword) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    rebase_wrapped_schema_refs(child);
+                }
+            } else {
+                rebase_wrapped_schema_refs(child);
+            }
+        }
+    }
+}
+
+fn wrap_anthropic_tool_input(name: &str, input: Value, context: &CodexToolContext) -> Value {
+    if tool_needs_anthropic_input_wrapper(name, context) {
+        json!({ ANTHROPIC_TOOL_INPUT_FIELD: input })
+    } else {
+        input
+    }
+}
+
+pub(crate) fn unwrap_anthropic_tool_input(
+    name: &str,
+    input: Value,
+    context: &CodexToolContext,
+) -> Result<Value, ProxyError> {
+    if !tool_needs_anthropic_input_wrapper(name, context) {
+        return Ok(input);
+    }
+    let inner = input
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get(ANTHROPIC_TOOL_INPUT_FIELD))
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            ProxyError::TransformError(format!(
+                "Anthropic tool '{name}' returned invalid wrapped arguments"
+            ))
+        })?;
+    Ok(inner.clone())
 }
 
 /// tool_choice: Responses → Anthropic (the reverse of `map_tool_choice_to_responses`)
@@ -579,6 +705,7 @@ fn convert_input_to_messages(
                     )));
                 }
                 let input = sanitize_anthropic_tool_use_input(name, input);
+                let input = wrap_anthropic_tool_input(&upstream_name, input, tool_context);
                 push_block(
                     &mut messages,
                     "assistant",
@@ -1367,6 +1494,7 @@ pub(crate) fn anthropic_response_to_responses_with_context(
                     let call_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let input = block.get("input").cloned().unwrap_or(json!({}));
+                    let input = unwrap_anthropic_tool_input(name, input, tool_context)?;
                     let input = sanitize_anthropic_tool_use_input(name, input);
                     let item_id =
                         response_tool_call_item_id_from_chat_name(call_id, name, tool_context);
@@ -1787,13 +1915,200 @@ mod tests {
         let input_schema = &result["tools"][0]["input_schema"];
 
         assert_eq!(input_schema["type"], "object");
+        assert!(input_schema.get("oneOf").is_none());
         assert_eq!(
-            input_schema["oneOf"][0]["properties"]["mode"]["type"],
+            input_schema["properties"][ANTHROPIC_TOOL_INPUT_FIELD]["oneOf"][0]["properties"]
+                ["mode"]["type"],
             "string"
         );
         assert_eq!(
-            input_schema["oneOf"][1]["properties"]["name"]["type"],
+            input_schema["properties"][ANTHROPIC_TOOL_INPUT_FIELD]["oneOf"][1]["properties"]
+                ["name"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn root_compositions_are_nested_without_losing_constraints() {
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            let mut schema = json!({
+                "type": "object",
+                "properties": { "shared": { "type": "string" } },
+                "required": ["shared"],
+                "additionalProperties": false
+            });
+            schema[keyword] = json!([
+                { "properties": { "shared": { "enum": ["a", "b"] } } },
+                { "properties": { "shared": { "minLength": 1 } } }
+            ]);
+            let result = responses_request_to_anthropic(
+                json!({
+                    "model": "claude-opus-5-5",
+                    "tools": [{
+                        "type": "function", "name": "union",
+                        "description": "Original description", "strict": true,
+                        "parameters": schema.clone()
+                    }],
+                    "input": "hi"
+                }),
+                4096,
+            )
+            .unwrap();
+            let tool = &result["tools"][0];
+            let outer = &tool["input_schema"];
+            assert_eq!(outer["type"], "object");
+            assert!(outer.get(keyword).is_none());
+            assert_eq!(outer["properties"][ANTHROPIC_TOOL_INPUT_FIELD], schema);
+            assert_eq!(outer["required"], json!([ANTHROPIC_TOOL_INPUT_FIELD]));
+            assert_eq!(outer["additionalProperties"], false);
+            assert_eq!(tool["description"], "Original description");
+            assert_eq!(tool["strict"], true);
+        }
+    }
+
+    #[test]
+    fn wrapped_schema_rebases_local_refs_but_not_literal_data_or_other_resources() {
+        let original = json!({
+            "$ref": "#/$defs/input",
+            "$defs": {
+                "input": {
+                    "type": "object",
+                    "properties": {
+                        "child": { "$ref": "#" },
+                        "literal": { "const": { "$ref": "#/not-a-schema" } },
+                        "external": { "$ref": "https://example.invalid/schema.json" },
+                        "resource": { "$id": "child.json", "$ref": "#/$defs/child" }
+                    },
+                    "default": { "$ref": "#/also-literal" }
+                }
+            }
+        });
+        let result = chat_tool_to_anthropic_tool(&json!({
+            "function": { "name": "ref", "parameters": original }
+        }))
+        .unwrap();
+        let inner = &result["input_schema"]["properties"][ANTHROPIC_TOOL_INPUT_FIELD];
+        assert_eq!(inner["$ref"], "#/properties/_ccs_input/$defs/input");
+        let props = &inner["$defs"]["input"]["properties"];
+        assert_eq!(props["child"]["$ref"], "#/properties/_ccs_input");
+        assert_eq!(props["literal"]["const"]["$ref"], "#/not-a-schema");
+        assert_eq!(
+            props["external"]["$ref"],
+            "https://example.invalid/schema.json"
+        );
+        assert_eq!(props["resource"]["$ref"], "#/$defs/child");
+        assert_eq!(inner["$defs"]["input"]["default"]["$ref"], "#/also-literal");
+        let mut own_resource = json!({
+            "$id": "https://example.invalid/root.json",
+            "oneOf": [{ "$ref": "#/$defs/input" }]
+        });
+        let before = own_resource.clone();
+        rebase_wrapped_schema_refs(&mut own_resource);
+        assert_eq!(own_resource, before);
+    }
+
+    #[test]
+    fn property_level_compositions_keep_the_original_tool_shape() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        let result = chat_tool_to_anthropic_tool(&json!({
+            "function": { "name": "plain", "parameters": schema.clone() }
+        }))
+        .unwrap();
+        assert_eq!(result["input_schema"], schema);
+    }
+
+    #[test]
+    fn wrapped_namespace_tool_round_trips_arguments_and_signed_history() {
+        let request = json!({
+            "model": "claude-opus-5-5",
+            "reasoning": { "effort": "medium" },
+            "tools": [{
+                "type": "namespace", "name": "fixture",
+                "tools": [{
+                    "type": "function", "name": "union",
+                    "parameters": {
+                        "oneOf": [
+                            { "type": "object", "required": ["mode"] },
+                            { "type": "object", "required": ["name"] }
+                        ]
+                    }
+                }]
+            }],
+            "input": [{ "role": "user", "content": "test" }]
+        });
+        let context = build_codex_tool_context_from_request(&request);
+        let arguments = json!({ "mode": "read", "_ccs_input": "original user property" });
+        let response = anthropic_response_to_responses_with_context(
+            json!({
+                "id": "msg_wrapped", "model": "claude-opus-5-5", "stop_reason": "tool_use",
+                "content": [
+                    { "type": "thinking", "thinking": "reason", "signature": "fixture-signature" },
+                    {
+                        "type": "tool_use", "id": "call_wrapped", "name": "fixture__union",
+                        "input": { ANTHROPIC_TOOL_INPUT_FIELD: arguments.clone() }
+                    }
+                ]
+            }),
+            &context,
+        )
+        .unwrap();
+        let call = &response["output"][1];
+        assert_eq!(call["namespace"], "fixture");
+        assert_eq!(call["name"], "union");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+            arguments
+        );
+        let mut replay = request.clone();
+        replay["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(response["output"].as_array().unwrap().iter().cloned());
+        replay["input"].as_array_mut().unwrap().push(json!({
+            "type": "function_call_output", "call_id": "call_wrapped", "output": "done"
+        }));
+        let upstream = responses_request_to_anthropic(replay, 4096).unwrap();
+        assert_eq!(
+            upstream["messages"][1]["content"][0]["signature"],
+            "fixture-signature"
+        );
+        assert_eq!(
+            upstream["messages"][1]["content"][1]["input"],
+            json!({ ANTHROPIC_TOOL_INPUT_FIELD: arguments })
+        );
+        assert_eq!(
+            upstream["messages"][2]["content"][0]["tool_use_id"],
+            "call_wrapped"
+        );
+    }
+
+    #[test]
+    fn malformed_wrapped_tool_arguments_are_rejected_before_execution() {
+        let context = build_codex_tool_context_from_request(&json!({
+            "tools": [{
+                "type": "function", "name": "union",
+                "parameters": { "anyOf": [{ "type": "object" }] }
+            }]
+        }));
+        for invalid in [
+            json!({}),
+            json!({ "mode": "read" }),
+            json!({ ANTHROPIC_TOOL_INPUT_FIELD: [] }),
+            json!({ ANTHROPIC_TOOL_INPUT_FIELD: {}, "extra": true }),
+        ] {
+            assert!(unwrap_anthropic_tool_input("union", invalid, &context).is_err());
+        }
+        let plain = json!({ "_ccs_input": "unrelated property" });
+        assert_eq!(
+            unwrap_anthropic_tool_input("plain", plain.clone(), &context).unwrap(),
+            plain
         );
     }
 

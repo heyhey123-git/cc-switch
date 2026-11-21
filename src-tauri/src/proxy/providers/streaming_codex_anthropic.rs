@@ -10,7 +10,8 @@ use super::codex_compaction;
 use super::codex_responses_sse as sse;
 use super::transform_codex_anthropic::{
     build_responses_usage_from_anthropic, map_anthropic_stop_reason_to_status,
-    responses_reasoning_item_from_anthropic_block,
+    responses_reasoning_item_from_anthropic_block, tool_needs_anthropic_input_wrapper,
+    unwrap_anthropic_tool_input,
 };
 #[cfg(test)]
 use super::transform_codex_anthropic::{
@@ -299,7 +300,10 @@ impl AnthropicToResponsesState {
                     .unwrap_or("");
                 block.accum.push_str(partial);
                 // The Read tool needs to be sanitized at close time, to avoid emitting pages:"" deltas mid-stream
-                if block.name == "Read" || self.tool_context.is_custom_tool_chat_name(&block.name) {
+                if block.name == "Read"
+                    || self.tool_context.is_custom_tool_chat_name(&block.name)
+                    || tool_needs_anthropic_input_wrapper(&block.name, &self.tool_context)
+                {
                     return Vec::new();
                 }
                 vec![sse::function_call_arguments_delta(
@@ -367,6 +371,26 @@ impl AnthropicToResponsesState {
                 } else {
                     text
                 };
+                let is_wrapped = tool_needs_anthropic_input_wrapper(&name, &self.tool_context);
+                let raw_input = if is_wrapped {
+                    let decoded = serde_json::from_str(&raw_input)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            unwrap_anthropic_tool_input(&name, input, &self.tool_context)
+                                .map_err(|error| error.to_string())
+                        });
+                    match decoded {
+                        Ok(input) => input.to_string(),
+                        Err(error) => {
+                            return self
+                                .failed_event(error, Some("invalid_tool_arguments".to_string()))
+                                .into_iter()
+                                .collect();
+                        }
+                    }
+                } else {
+                    raw_input
+                };
                 let arguments = if raw_input.trim().is_empty() {
                     "{}".to_string()
                 } else if name == "Read" {
@@ -398,6 +422,13 @@ impl AnthropicToResponsesState {
                             input,
                         ));
                     } else {
+                        if is_wrapped {
+                            events.push(sse::function_call_arguments_delta(
+                                output_index,
+                                &item_id,
+                                &arguments,
+                            ));
+                        }
                         events.push(sse::function_call_arguments_done(
                             output_index,
                             &item_id,
@@ -854,6 +885,128 @@ mod tests {
             .into_iter()
             .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
             .collect()
+    }
+
+    fn union_tool_context() -> CodexToolContext {
+        super::super::transform_codex_chat::build_codex_tool_context_from_request(&json!({
+            "tools": [{
+                "type": "namespace", "name": "fixture",
+                "tools": [{
+                    "type": "function", "name": "union",
+                    "parameters": {
+                        "anyOf": [
+                            { "type": "object", "required": ["mode"] },
+                            { "type": "object", "required": ["name"] }
+                        ]
+                    }
+                }]
+            }]
+        }))
+    }
+
+    fn parsed_fixture_events(stream: &str) -> Vec<Value> {
+        stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wrapped_arguments_are_unwrapped_after_all_stream_fragments() {
+        let upstream = [
+            json!({"type":"message_start","message":{"id":"msg_union"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"call_union","name":"fixture__union","input":{}
+            }}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"{\"_ccs_in"
+            }}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"put\":{\"mode\":\"read\"}}"
+            }}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let result = run_with_context(&upstream, union_tool_context()).await;
+        assert!(!result.contains("_ccs_input"));
+        let events = parsed_fixture_events(&result);
+        let deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<Value>(&deltas).unwrap(),
+            json!({"mode":"read"})
+        );
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(done["arguments"].as_str().unwrap()).unwrap(),
+            json!({"mode":"read"})
+        );
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let call = &completed["response"]["output"][0];
+        assert_eq!(call["name"], "union");
+        assert_eq!(call["namespace"], "fixture");
+    }
+
+    #[tokio::test]
+    async fn wrapped_arguments_in_start_only_and_json_responses_are_unwrapped() {
+        let message = json!({
+            "id":"msg_union","type":"message","model":"claude-opus-5-5",
+            "role":"assistant","stop_reason":"tool_use",
+            "content":[{
+                "type":"tool_use","id":"call_union","name":"fixture__union",
+                "input":{"_ccs_input":{"name":"test"}}
+            }]
+        });
+        for upstream in [
+            message.to_string(),
+            [
+                json!({"type":"message_start","message":{"id":"msg_union"}}),
+                json!({"type":"content_block_start","index":0,"content_block":message["content"][0]}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                json!({"type":"message_stop"})
+            ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>()
+        ] {
+            let result = run_with_context(&upstream, union_tool_context()).await;
+            assert!(!result.contains("_ccs_input"));
+            let events = parsed_fixture_events(&result);
+            let completed = events.iter().find(|event|
+                event["type"] == "response.completed").unwrap();
+            let call = &completed["response"]["output"][0];
+            assert_eq!(serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+                       json!({"name":"test"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_wrapped_stream_fails_without_publishing_tool_arguments() {
+        let upstream = json!({
+            "id":"msg_invalid","type":"message","model":"claude-opus-5-5",
+            "role":"assistant","stop_reason":"tool_use",
+            "content":[{
+                "type":"tool_use","id":"call_union","name":"fixture__union",
+                "input":{"wrong":"shape"}
+            }]
+        })
+        .to_string();
+        let result = run_with_context(&upstream, union_tool_context()).await;
+        assert!(result.contains("event: response.failed"));
+        assert!(!result.contains("event: response.completed"));
+        assert!(!result.contains("response.function_call_arguments.done"));
     }
 
     fn render_message_events(body: &Value) -> String {

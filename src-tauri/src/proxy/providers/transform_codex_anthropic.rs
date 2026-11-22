@@ -1946,7 +1946,7 @@ mod tests {
     fn test_tool_enumeration_order_does_not_change_claude_prompt_prefix() {
         let mut request = json!({"model":"claude-opus-5-5","instructions":"stable",
         "input":[{"role":"user","content":"Use the selected tool."}],
-        "tool_choice":{"type":"function","name":"a_read"},
+            "tool_choice":{"type":"auto"},
         "tools":[
             {"type":"function","name":"z_read","parameters":{"type":"object","properties":{"z":{"type":"string"}}}},
             {"type":"namespace","name":"files","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
@@ -1961,7 +1961,8 @@ mod tests {
         request["tools"].as_array_mut().unwrap().reverse();
         let next = responses_request_to_anthropic(request, 32000).unwrap();
         assert_eq!(first, next);
-        assert_eq!(first["tool_choice"]["name"], "a_read");
+        assert_eq!(first["tool_choice"]["type"], "auto");
+        assert_eq!(first["tools"][0]["name"], "a_read");
     }
 
     #[test]

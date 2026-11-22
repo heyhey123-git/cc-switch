@@ -16,13 +16,14 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | 工具参数中的 _id / _meta / __typename | 采用上游已包含的修复，保留原始工具参数 |
 | OpenAI 工具 strict 字段 | 采用上游修复，不将该字段透传给 Anthropic / Bedrock 工具定义 |
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
+| 看图后的图片缩放通知 | 修复版 3 将固定格式尺寸通知保留在原历史位置，避免新增通知改写 system、使已有消息缓存失效；普通 developer 指令仍进入 system |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
 | 压缩的 SSE 响应 | 在事件转换前增量解压 gzip、deflate（zlib）、br、zstd 及堆叠编码；不等待整条流结束 |
 | 私有 CA 站点 | 可在本机按 HTTPS origin 固定证书 SHA256；仍检查域名、有效期及 TLS 握手签名，拒绝重定向 |
 | 鉴权、真实缓存、图片、工具续接、摘要后继续 | 旧修复版曾通过 Sonnet 小额实网验收；本次升级只执行不计费的本地回归，其他部署按第 7 节验收 |
 
-本次升级已通过 1989 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
+本次升级已通过 1994 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
 模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
 此前 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
@@ -32,7 +33,7 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.2/CC-Switch-4.0.38-Claude-Fix.2-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.3/CC-Switch-4.0.38-Claude-Fix.3-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
@@ -292,6 +293,15 @@ Content-Type: application/json
 本地默认标记是 5 分钟，最多四个断点。Sub2API 的实际版本可能重写断点、
 TTL 或账号路由，需要结合商家的请求日志确认最终发给上游的内容。
 
+修复版 2 会把 Codex 看图后生成的 `image_resize_notice` developer 条目提升到全局 system。
+每次新增尺寸提示都会改变消息之前的前缀，长会话可能只命中工具等较短的固定部分。
+修复版 3 仅将完整匹配 Codex 固定格式的图片尺寸元数据作为对应工具结果中的文字保留在原位；
+没有相邻工具结果时在原历史位置保留，不跨越其他内容回填到旧工具结果。
+尺寸信息和图片均保留，不删除提示，也不将普通 developer 指令降为用户内容。
+本地回归覆盖连续两次看图、超过 50 万字符的历史、缓存标记和混合 developer 指令。
+已有会话中旧尺寸提示的位置在升级时会改变，首轮可能重新写入大段缓存；
+先用短会话核对新版本，不要主动重放长历史或反复预热。修复本地前缀变化不代表每次请求一定命中远端缓存。
+
 查看 `cache_read_input_tokens`、`cache_creation_input_tokens`；
 Codex 对应 `cachedInputTokens`、`cacheWriteInputTokens`。
 Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单价计算。
@@ -419,6 +429,8 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 | input_schema 顶层 oneOf / allOf / anyOf 400 | 安装本修复版；保留原始 schema，不手工删除约束或工具 |
 | 502：connection closed / TLS EOF / 连接被重置 | 查看供应商和实际出站错误；CCS 出站代理留空，在 Clash 核对 TUN、DNS、规则及节点状态。本机 /responses 是客户端入口 |
 | 只缓存很小的固定前缀 | 查看实际 Messages 断点、TTL、会话路由和回传统计 |
+| 看图后大段缓存重写 | 使用修复版 3；固定格式图片尺寸通知应留在历史原位，普通 developer 指令保持原权限。升级旧会话时注意一次性缓存重建 |
+| upstream_status: HTTP 502 且没有错误详情 | 记录时间与请求 ID，对照站内 /v1/messages 错误日志；不要与本地 Connect / SendRequest 错误混为一类。图片缓存修复不代表此类 502 已解决 |
 | 流中断、输出突然结束 | 核对内部 status/incomplete_details；不能只看 response.completed 事件名 |
 | gzip SSE 出现乱码或没有终止事件 | 使用修复版 2；压缩字节须先解码再交给事件改写器，单纯删掉 Content-Encoding 会损坏响应 |
 | 私有 CA / unknown issuer / certificate verify failed | 按第 3 节配置可信 CA 或本机证书指纹；证书更新后核对新指纹 |

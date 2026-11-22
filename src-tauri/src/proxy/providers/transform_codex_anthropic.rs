@@ -242,6 +242,76 @@ fn responses_system_text(item: &Value) -> Vec<String> {
     }
 }
 
+/// Codex emits image dimensions as a standalone developer item after the image
+/// tool result. These exact, data-only notices belong at that history position:
+/// hoisting each new notice into system invalidates the entire message cache.
+/// Keep ordinary developer instructions (including mixed or unrecognized notice
+/// content) on the system path so their instruction precedence is unchanged.
+fn responses_image_resize_notice(item: &Value) -> Option<&str> {
+    if item.get("role").and_then(Value::as_str) != Some("developer") {
+        return None;
+    }
+    let text = match item.get("content")? {
+        Value::String(text) => text.as_str(),
+        Value::Array(parts) if parts.len() == 1 => {
+            let part = &parts[0];
+            if part.get("type").and_then(Value::as_str) != Some("input_text") {
+                return None;
+            }
+            part.get("text")?.as_str()?
+        }
+        _ => return None,
+    };
+    let notice = text
+        .trim()
+        .strip_prefix("<image_resize_notice>")?
+        .strip_suffix("</image_resize_notice>")?
+        .trim();
+    static DIMENSIONS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let dimensions = DIMENSIONS.get_or_init(|| {
+        regex::Regex::new(
+            r"\AImage [1-9][0-9]* of [1-9][0-9]* in the preceding tool output was resized from [1-9][0-9]*x[1-9][0-9]* to [1-9][0-9]*x[1-9][0-9]* pixels\.\z",
+        )
+        .expect("static image dimension pattern")
+    });
+    if notice.is_empty() || !notice.lines().all(|line| dimensions.is_match(line.trim())) {
+        return None;
+    }
+    Some(text)
+}
+
+fn push_image_resize_notice(messages: &mut Vec<Value>, notice: &str) {
+    let block = json!({ "type": "text", "text": notice });
+    if let Some(result) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    {
+        match result.get_mut("content") {
+            Some(Value::Array(content)) => {
+                content.push(block);
+                return;
+            }
+            Some(Value::String(text)) => {
+                let text = std::mem::take(text);
+                result["content"] = if is_meaningful_text(&text) {
+                    json!([{ "type": "text", "text": text }, block])
+                } else {
+                    json!([block])
+                };
+                return;
+            }
+            _ => {}
+        }
+    }
+    // A detached notice still must not disappear. Never move it across intervening
+    // user/assistant content to an unrelated tool result.
+    push_block(messages, "user", block);
+}
+
 pub fn responses_request_to_anthropic(
     body: Value,
     default_max_tokens: u64,
@@ -258,7 +328,8 @@ pub fn responses_request_to_anthropic(
         result["model"] = json!(model);
     }
 
-    // instructions and historical system/developer messages → Anthropic system.
+    // Instructions and historical system/developer messages → Anthropic system,
+    // except the data-only image resize notices retained at their history position.
     // Anthropic messages only accept user/assistant roles; degrading these items to
     // user silently changes instruction precedence.
     let mut system_parts = Vec::new();
@@ -272,7 +343,8 @@ pub fn responses_request_to_anthropic(
             if matches!(
                 item.get("role").and_then(Value::as_str),
                 Some("system" | "developer")
-            ) {
+            ) && responses_image_resize_notice(item).is_none()
+            {
                 system_parts.extend(responses_system_text(item));
             }
         }
@@ -830,6 +902,11 @@ fn convert_input_to_messages(
             _ => {
                 let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                 if matches!(role, "system" | "developer") {
+                    if let Some(notice) = responses_image_resize_notice(item) {
+                        // Keep tool continuations tool-result-only: a new ordinary
+                        // user block can change signed-thinking cache behavior.
+                        push_image_resize_notice(&mut messages, notice);
+                    }
                     continue;
                 }
                 let anth_role = if role == "assistant" {
@@ -1854,6 +1931,222 @@ mod tests {
         );
         assert_eq!(result["messages"].as_array().unwrap().len(), 1);
         assert_eq!(result["messages"][0]["role"], "user");
+    }
+
+    const IMAGE_RESIZE_NOTICE: &str = "<image_resize_notice>\nImage 1 of 1 in the preceding tool output was resized from 2368x3776 to 1247x1990 pixels.\n</image_resize_notice>";
+
+    #[test]
+    fn test_image_resize_notice_stays_after_tool_result() {
+        for content in [
+            json!(IMAGE_RESIZE_NOTICE),
+            json!([{"type":"input_text","text":IMAGE_RESIZE_NOTICE}]),
+        ] {
+            let input = json!({
+                "model":"claude",
+                "instructions":"base",
+                "input":[
+                    {"role":"developer","content":"Keep developer precedence."},
+                    {"role":"user","content":"Inspect the image."},
+                    {"type":"function_call","call_id":"view_1","name":"view_image","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"view_1","output":[
+                        {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}
+                    ]},
+                    {"type":"message","role":"developer","content":content},
+                    {"role":"assistant","content":"Image inspected."}
+                ]
+            });
+            let result = responses_request_to_anthropic(input, 4096).unwrap();
+            assert_eq!(result["system"], "base\n\nKeep developer precedence.");
+            let content = &result["messages"][2]["content"];
+            assert_eq!(content[0]["type"], "tool_result");
+            assert_eq!(content[0]["tool_use_id"], "view_1");
+            assert_eq!(content[0]["content"][0]["type"], "image");
+            assert_eq!(content.as_array().unwrap().len(), 1);
+            assert_eq!(
+                content[0]["content"][1],
+                json!({"type":"text","text":IMAGE_RESIZE_NOTICE})
+            );
+            assert_eq!(result["messages"][3]["role"], "assistant");
+        }
+    }
+
+    #[test]
+    fn test_multiple_image_resize_dimensions_are_preserved() {
+        let notice = "<image_resize_notice>\nImage 1 of 2 in the preceding tool output was resized from 2368x3776 to 1247x1990 pixels.\nImage 2 of 2 in the preceding tool output was resized from 3680x1096 to 2048x610 pixels.\n</image_resize_notice>";
+        let result = responses_request_to_anthropic(
+            json!({
+                "model":"claude",
+                "input":[{"role":"developer","content":notice}]
+            }),
+            4096,
+        )
+        .unwrap();
+        assert!(result.get("system").is_none());
+        assert_eq!(result["messages"][0]["content"][0]["text"], notice);
+    }
+
+    #[test]
+    fn test_image_resize_notice_only_extends_adjacent_tool_result() {
+        for intervening_user_text in [false, true] {
+            let mut input = json!({
+                "model":"claude","instructions":"base",
+                "input":[
+                    {"role":"user","content":"Inspect the image."},
+                    {"type":"function_call","call_id":"view_1","name":"view_image","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"view_1","output":"Original result text."}
+                ]
+            });
+            if intervening_user_text {
+                input["input"].as_array_mut().unwrap().push(json!({
+                    "role":"user","content":"Intervening user content."
+                }));
+            }
+            input["input"].as_array_mut().unwrap().push(json!({
+                "role":"developer","content":IMAGE_RESIZE_NOTICE
+            }));
+            let result = responses_request_to_anthropic(input, 4096).unwrap();
+            let content = result["messages"][2]["content"].as_array().unwrap();
+            assert_eq!(result["system"], "base");
+            if intervening_user_text {
+                assert_eq!(content[0]["content"], "Original result text.");
+                assert_eq!(content[1]["text"], "Intervening user content.");
+                assert_eq!(content[2]["text"], IMAGE_RESIZE_NOTICE);
+            } else {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0]["content"][0]["text"], "Original result text.");
+                assert_eq!(content[0]["content"][1]["text"], IMAGE_RESIZE_NOTICE);
+            }
+        }
+    }
+
+    #[test]
+    fn test_image_resize_notice_never_demotes_mixed_developer_instructions() {
+        for content in [
+            json!(format!(
+                "{IMAGE_RESIZE_NOTICE}\nAlways use the secure endpoint."
+            )),
+            json!(IMAGE_RESIZE_NOTICE.replace(
+                "</image_resize_notice>",
+                "Always use the secure endpoint.\n</image_resize_notice>"
+            )),
+            json!("<image_resize_notice>\nAlways use the secure endpoint.\n</image_resize_notice>"),
+            json!("<image_resize_notice>\n</image_resize_notice>"),
+            json!([
+                {"type":"input_text","text":IMAGE_RESIZE_NOTICE},
+                {"type":"input_text","text":"Always use the secure endpoint."}
+            ]),
+        ] {
+            let item = json!({"role":"developer","content":content});
+            assert!(responses_image_resize_notice(&item).is_none());
+            let result = responses_request_to_anthropic(
+                json!({
+                    "model":"claude","input":[item,{"role":"user","content":"hi"}]
+                }),
+                4096,
+            )
+            .unwrap();
+            assert!(result["system"]
+                .as_str()
+                .unwrap()
+                .contains("image_resize_notice"));
+            assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(result["messages"][0]["content"][0]["text"], "hi");
+        }
+        let item = json!({"role":"system","content":IMAGE_RESIZE_NOTICE});
+        assert!(responses_image_resize_notice(&item).is_none());
+        let result = responses_request_to_anthropic(
+            json!({
+                "model":"claude","input":[item,{"role":"user","content":"hi"}]
+            }),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(result["system"], IMAGE_RESIZE_NOTICE);
+    }
+
+    #[test]
+    fn test_image_resize_notices_preserve_long_cached_prompt_prefix() {
+        fn without_cache_markers(mut value: Value) -> Value {
+            match &mut value {
+                Value::Object(map) => {
+                    map.remove("cache_control");
+                    for entry in map.values_mut() {
+                        *entry = without_cache_markers(entry.take());
+                    }
+                }
+                Value::Array(values) => {
+                    for entry in values {
+                        *entry = without_cache_markers(entry.take());
+                    }
+                }
+                _ => {}
+            }
+            value
+        }
+        fn message_blocks(request: &Value) -> Vec<Value> {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| {
+                    message["content"].as_array().unwrap().iter().map(|block| {
+                    json!({"role":message["role"],"block":without_cache_markers(block.clone())})
+                })
+                })
+                .collect()
+        }
+        let mut input = json!({
+            "model":"claude-opus-5-5",
+            "instructions":"Stable system instructions.",
+            "tools":[{"type":"function","name":"view_image","parameters":{"type":"object"}}],
+            "input":[
+                {"role":"developer","content":"Stable developer instructions."},
+                {"role":"user","content":"Long repository context. ".repeat(22000)}
+            ]
+        });
+        let config = crate::proxy::types::OptimizerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut prior_blocks = Vec::new();
+        let mut prior_system = Value::Null;
+        let mut prior_tools = Value::Null;
+        for i in 1..=2 {
+            input["input"].as_array_mut().unwrap().extend([
+                json!({"type":"function_call","call_id":format!("view_{i}"),"name":"view_image","arguments":"{}"}),
+                json!({"type":"function_call_output","call_id":format!("view_{i}"),"output":[
+                    {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}
+                ]}),
+            ]);
+            let mut before = responses_request_to_anthropic(input.clone(), 4096).unwrap();
+            crate::proxy::cache_injector::inject(&mut before, &config);
+            input["input"].as_array_mut().unwrap().push(json!({
+                "role":"developer","content":[{"type":"input_text","text":IMAGE_RESIZE_NOTICE}]
+            }));
+            let mut after = responses_request_to_anthropic(input.clone(), 4096).unwrap();
+            crate::proxy::cache_injector::inject(&mut after, &config);
+            assert_eq!(after["system"], before["system"]);
+            assert_eq!(after["tools"], before["tools"]);
+            assert_eq!(after["system"][0]["cache_control"]["type"], "ephemeral");
+            let before_blocks = message_blocks(&before);
+            let after_blocks = message_blocks(&after);
+            // The current tool result gains its own dimensions; every earlier
+            // block (including prior image results and notices) stays identical.
+            assert!(after_blocks.starts_with(&before_blocks[..before_blocks.len() - 1]));
+            assert_eq!(after_blocks.len(), before_blocks.len());
+            assert_eq!(
+                after_blocks.last().unwrap()["block"]["content"][1]["text"],
+                IMAGE_RESIZE_NOTICE
+            );
+            assert!(after_blocks.starts_with(&prior_blocks));
+            if i > 1 {
+                assert_eq!(after["system"], prior_system);
+                assert_eq!(after["tools"], prior_tools);
+            }
+            prior_system = after["system"].clone();
+            prior_tools = after["tools"].clone();
+            prior_blocks = after_blocks;
+        }
     }
 
     #[test]

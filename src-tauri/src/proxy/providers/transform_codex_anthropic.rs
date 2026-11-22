@@ -2313,10 +2313,10 @@ mod tests {
         let result = responses_request_to_anthropic(input, 4096).unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "get_weather");
-        assert_eq!(tools[0]["input_schema"]["type"], "object");
-        assert!(tools[0].get("parameters").is_none());
-        assert_eq!(tools[1]["name"], "apply_patch");
+        assert_eq!(tools[0]["name"], "apply_patch");
+        assert_eq!(tools[1]["name"], "get_weather");
+        assert_eq!(tools[1]["input_schema"]["type"], "object");
+        assert!(tools[1].get("parameters").is_none());
     }
 
     #[test]

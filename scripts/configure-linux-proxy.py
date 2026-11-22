@@ -35,10 +35,13 @@ if active == 'cc_switch_remote':
     raise SystemExit('Server CCS is already configured; keep the existing credentials and edit its provider settings.')
 upstream = config['model_providers'][active]
 assert upstream.get('wire_api','responses') == 'responses', 'Existing native provider must use Responses'
-auth = json.loads((codex/'auth.json').read_text('utf-8'))
-native_key = auth.get('OPENAI_API_KEY') or upstream.get('experimental_bearer_token')
+auth_path = codex/'auth.json'
+auth = json.loads(auth_path.read_text('utf-8')) if auth_path.exists() else {}
+native_key = upstream.get('experimental_bearer_token')
 if not native_key and upstream.get('env_key'):
     native_key = os.environ.get(upstream['env_key'])
+elif not native_key and upstream.get('requires_openai_auth',True):
+    native_key = auth.get('OPENAI_API_KEY')
 assert native_key, 'Existing provider API key could not be resolved; no files changed'
 assert 1 <= args.port <= 65535
 anthropic = data['anthropic']
@@ -99,6 +102,10 @@ assert tomllib.loads(new_config)==expected, 'Unrelated Codex configuration would
 native_settings = {'auth':{'OPENAI_API_KEY':native_key},'config':original}
 claude_config = f'model_provider="custom"\n[model_providers.custom]\nname="Claude relay"\nbase_url={json.dumps(base)}\nwire_api="responses"\n'
 claude_settings = {'auth':{'OPENAI_API_KEY':anthropic['api_key']},'config':claude_config}
+claude_meta = {'apiFormat':'anthropic','commonConfigEnabled':False,'impersonateClaudeCode':False,'maxOutputTokens':16384}
+for key in ['customUserAgent','usage_script']:
+    if key in data.get('claude_meta',{}):
+        claude_meta[key] = data['claude_meta'][key]
 pin_path = cc/'tls-pins.json'
 files = {config_path:new_config.encode(), catalog_path:json.dumps(catalog_after,ensure_ascii=False,indent=2).encode(),
          state_path:json.dumps(state,indent=2).encode()}
@@ -129,7 +136,7 @@ try:
     conn.execute('begin immediate')
     for identifier,name,settings,meta in [
         ('server-native','Existing native Responses',native_settings,{'apiFormat':'openai_responses','commonConfigEnabled':False}),
-        ('server-claude','Claude relay',claude_settings,{'apiFormat':'anthropic','commonConfigEnabled':False,'impersonateClaudeCode':False,'maxOutputTokens':16384}),
+        ('server-claude','Claude relay',claude_settings,claude_meta),
     ]:
         conn.execute('insert into providers(id,app_type,name,settings_config,meta,is_current) values(?,?,?,?,?,?)',
                      (identifier,'codex',name,json.dumps(settings),json.dumps(meta),int(identifier=='server-native')))

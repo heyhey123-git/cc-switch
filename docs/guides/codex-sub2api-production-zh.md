@@ -1,7 +1,8 @@
 # Codex + CC Switch + Sub2API：Claude 接入与运维
 
 核对日期：2026-11-22。验证组合：CC Switch v4.0.38 本分支、
-Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正式工作。
+Codex 0.171.0-alpha.13 / Windows，以及 Codex 0.160.0 / Ubuntu 24.04 x86_64 服务端。
+其他版本先按本文验收，再用于正式工作。
 本文和示例均不包含账户密钥、个人数据库或安装包。
 
 ## 1. 这份修复解决了什么
@@ -16,14 +17,18 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 | 工具参数中的 _id / _meta / __typename | 采用上游已包含的修复，保留原始工具参数 |
 | OpenAI 工具 strict 字段 | 采用上游修复，不将该字段透传给 Anthropic / Bedrock 工具定义 |
 | 图片、普通函数工具、签名回放 | 本地协议检查及真实 Codex 客户端流程通过 |
-| 看图后的图片缩放通知 | 修复版 3 将固定格式尺寸通知保留在原历史位置，避免新增通知改写 system、使已有消息缓存失效；普通 developer 指令仍进入 system |
+| 图片缩放通知 | 修复版 4 同时覆盖上传图片和工具图片、多图及分段通知，保留历史原位；普通 developer 指令仍进入 system |
+| 工具顺序和长尾追加 | Claude 工具定义按名称稳定排序；同一会话前缀未变时，保留上次请求的消息断点，避免追加超过 20 块后找不到旧断点 |
+| 缓存排查证据 | 输出工具、system、设置和历史前缀是否变化的指纹日志；不记录正文、图片、思考文本或密钥 |
+| Linux SSH 工作端 | `--headless` 在服务器本机提供代理，独立于 Windows，不需要图形桌面 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
 | 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
 | 压缩的 SSE 响应 | 在事件转换前增量解压 gzip、deflate（zlib）、br、zstd 及堆叠编码；不等待整条流结束 |
 | 私有 CA 站点 | 可在本机按 HTTPS origin 固定证书 SHA256；仍检查域名、有效期及 TLS 握手签名，拒绝重定向 |
 | 鉴权、真实缓存、图片、工具续接、摘要后继续 | 旧修复版曾通过 Sonnet 小额实网验收；本次升级只执行不计费的本地回归，其他部署按第 7 节验收 |
 
-本次升级已通过 1994 项完整代理模块原生回归。安装版验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
+Windows 客户端验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
+修复版 4 额外核对上传图、工具图、工具顺序及长尾追加的实际转换前缀；原生回归及安装产物验收结果见对应发行页。
 模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
 此前 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
@@ -33,7 +38,7 @@ Codex 0.171.0-alpha.13、Windows。其他版本先按本文验收，再用于正
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.3/CC-Switch-4.0.38-Claude-Fix.3-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.4/CC-Switch-4.0.38-Claude-Fix.4-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
@@ -61,6 +66,70 @@ cargo +stable build --release --locked --features tauri/custom-protocol
 `--offline`。单独运行默认 `cargo build --release` 不足以验证桌面生产打包。
 启用代理不代表 UI 已验收；必须实际打开窗口，确认没有开发服务器连接错误。
 替换安装文件前退出 CC Switch，并保留当前安装包及配置备份。
+
+### Linux：供 SSH 远程 Codex 工作端使用
+
+SSH 协作时，请求由服务器上的 Codex app-server 发起，因此服务器要有自己的 CCS 进程、
+配置和密钥。`127.0.0.1:15721` 指服务器本机。这个部署不依赖 Windows CCS 或端口转发。
+已验证的目标是 Ubuntu 24.04 x86_64、Python 3.12；配置脚本要求 Python 3.11 或更高版本。
+
+从[同一发行页](https://github.com/heyhey123-git/cc-switch/releases/tag/v4.0.38-claude-fix.4)
+下载 Linux `.deb`、`cc-switch-proxy@.service`、`configure-linux-proxy.py` 和 `SHA256SUMS`。
+下载后先核对 SHA256，再安装；二进制仍链接 GTK/WebKit 运行库，但 headless 模式不初始化图形界面，
+无需桌面、DISPLAY 或 Xvfb。桌面版和 headless 服务不要同时占用同一用户的配置及端口。
+
+```bash
+sudo apt install ./CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb
+sudo install -m 644 cc-switch-proxy@.service /etc/systemd/system/
+```
+
+下面的初始化和配置命令应由**运行远程 Codex 的同一用户**执行。
+先确认这个用户已经有可工作的 API Key 型 Codex 配置，且 `model_catalog_json`
+指向现有模型目录；脚本会导入该供应商，保留默认模型、原有模型、项目、功能配置及 `auth.json`。
+OAuth 登录配置不适用这个导入脚本。
+
+```bash
+cc-switch --headless --init-only
+umask 077
+mkdir -p ~/.cc-switch
+# 用编辑器创建下面示例对应的私密配置文件。
+${EDITOR:-vi} ~/.cc-switch/linux-provider.json
+python3 configure-linux-proxy.py --input ~/.cc-switch/linux-provider.json --dry-run
+python3 configure-linux-proxy.py --input ~/.cc-switch/linux-provider.json
+sudo systemctl daemon-reload
+sudo systemctl enable --now "cc-switch-proxy@$(id -un)"
+systemctl status "cc-switch-proxy@$(id -un)" --no-pager
+curl --noproxy '*' http://127.0.0.1:15721/health
+```
+
+私密输入文件示例，填入自己的信息，不要提交到 Git：
+
+```json
+{
+  "namespace": "claude",
+  "anthropic": {
+    "base_url": "https://YOUR-RELAY.example/v1",
+    "api_key": "YOUR-PRIVATE-KEY"
+  }
+}
+```
+
+应用前会在 `~/.cc-switch/backups/before-linux-proxy-*` 备份待修改文件和数据库；
+重复执行配置脚本会拒绝覆盖已有接入。脚本另加 `cc_switch_remote` 供应商，使用独立本地令牌，
+不替换原来的 `auth.json`。原 GPT 入口默认继续可选，四个 Claude 入口为
+`ccs-claude/claude-fable-5-2`、`ccs-claude/claude-opus-5-5`、
+`ccs-claude/claude-sonnet-5-5`、`ccs-claude/claude-haiku-5-5`。
+可在私密输入中提供与第 4 节一致的 `claude_models` 数组，以使用已经验收的模型元数据。
+
+私有 CA 的站点仍需按第 3 节配置服务器自己的 `~/.cc-switch/tls-pins.json`，
+使用经可信渠道确认的证书指纹，不关闭 TLS 校验。
+CCS 的出站代理留空，网络规则在服务器自己的 Clash/mihomo 中配置。
+headless 服务提供代理功能，额度页面使用中转站面板；它不提供桌面配置窗口。
+
+现有远程 Codex 进程不强制重启。准备好后重新连接 SSH 工作端，
+让新启动的 app-server 读取服务器配置，再在模型菜单选择 Claude。
+排查服务使用 `journalctl -u "cc-switch-proxy@$(id -un)" -n 80 --no-pager`。
+更新 Linux 包时先等待服务没有在处理模型请求，再重启该服务。
 
 ## 3. 配置链路
 
@@ -306,6 +375,25 @@ TTL 或账号路由，需要结合商家的请求日志确认最终发给上游�
 没有相邻工具结果时在原历史位置保留，不跨越其他内容回填到旧工具结果。
 尺寸信息和图片均保留，不删除提示，也不将普通 developer 指令降为用户内容。
 本地回归覆盖连续两次看图、超过 50 万字符的历史、缓存标记和混合 developer 指令。
+修复版 3 的匹配范围仅包含 `preceding tool output`，遗漏了用户上传图产生的
+`preceding user message`。修复版 4 同时识别这两种来源、多张图、CRLF 及多个纯通知文本块。
+通知只含固定格式的数字尺寸数据时才按历史元数据处理；夹带普通指令、图片或未知内容的
+developer 条目继续保留原指令权限。
+
+修复版 4 还对转换后的 Claude 工具数组按名称排序，避免相同工具仅因枚举顺序不同而造成全量重建。
+同一供应商、同一会话中，如果工具、system、设置和历史前缀未变，备用断点优先保留上次请求的
+消息断点，覆盖一次追加超过 20 个内容块的情况；仍最多四个断点，默认 5 分钟，不增加预热请求。
+跟踪保存在内存中，最多 128 个会话、每会话前 8192 块；进程重启或超出跟踪范围时使用常规断点策略。
+
+日志中的 `[CACHE_PREFIX]` 会显示 `tools_changed`、`system_changed`、`settings_changed`、
+`shared_blocks` 和前后块数，便于对照同一时刻的缓存账单。日志只包含摘要指纹和数量，
+不保存提示正文、工具参数、图片、思考内容或密钥。`initial=true` 表示本进程尚无前一请求可对比。
+它证明本地前缀是否变化，不代表服务端确认缓存写入成功。
+
+16,384 是本方案配置的单次总输出上限，包含 thinking，不是模型的上下文上限。
+xhigh 可能将这部分额度全部用在思考上，出现 `max_output_tokens` / incomplete；
+自动目标续接会再发下一轮。不要把这种相邻现象直接认定为缓存失效原因，
+应同时核对前缀日志和用量。提高输出上限也会提高单次费用风险，不为排查缓存自动提高。
 已有会话中旧尺寸提示的位置在升级时会改变，首轮可能重新写入大段缓存；
 先用短会话核对新版本，不要主动重放长历史或反复预热。修复本地前缀变化不代表每次请求一定命中远端缓存。
 
@@ -436,7 +524,8 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 | input_schema 顶层 oneOf / allOf / anyOf 400 | 安装本修复版；保留原始 schema，不手工删除约束或工具 |
 | 502：connection closed / TLS EOF / 连接被重置 | 查看供应商和实际出站错误；CCS 出站代理留空，在 Clash 核对 TUN、DNS、规则及节点状态。本机 /responses 是客户端入口 |
 | 只缓存很小的固定前缀 | 查看实际 Messages 断点、TTL、会话路由和回传统计 |
-| 看图后大段缓存重写 | 使用修复版 3；固定格式图片尺寸通知应留在历史原位，普通 developer 指令保持原权限。升级旧会话时注意一次性缓存重建 |
+| 看图后大段缓存重写 | 使用修复版 4，覆盖用户上传图与工具图通知；检查 `[CACHE_PREFIX]`，升级旧会话时注意一次性重建 |
+| 跨轮续接突然完全不命中 | 对齐工具、system、设置及 shared_blocks 变化；相同工具仅顺序改变和长尾追加已有本地回归，不能仅凭输出达到上限断言原因 |
 | upstream_status: HTTP 502 且没有错误详情 | 记录时间与请求 ID，对照站内 /v1/messages 错误日志；不要与本地 Connect / SendRequest 错误混为一类。图片缓存修复不代表此类 502 已解决 |
 | 流中断、输出突然结束 | 核对内部 status/incomplete_details；不能只看 response.completed 事件名 |
 | gzip SSE 出现乱码或没有终止事件 | 使用修复版 2；压缩字节须先解码再交给事件改写器，单纯删掉 Content-Encoding 会损坏响应 |
@@ -478,6 +567,8 @@ CCS 出站代理保持原设置，不用修改连接池重试参数处理证书�
 - `src-tauri/src/proxy/providers/transform_codex_anthropic.rs`
 - `src-tauri/src/proxy/providers/streaming_codex_anthropic.rs`
 - `src-tauri/src/proxy/thinking_optimizer.rs`
+- `src-tauri/src/proxy/cache_injector.rs`、`cache_diagnostics.rs` 及 `forwarder.rs` 的 Claude 专用注入调用
+- Linux 的 `headless_proxy.rs`、入口、systemd 单元和 `scripts/configure-linux-proxy.py`
 - `src-tauri/src/proxy/content_encoding.rs` 和 `handlers.rs` 中的 SSE 解码入口
 - `src-tauri/src/proxy/tls_pins.rs`、`forwarder/send.rs`、`http_client.rs` 和 `src-tauri/src/usage_script.rs` 中的按站点证书支持
 - `src-tauri/Cargo.toml`、`Cargo.lock` 中对应的解码与证书解析依赖

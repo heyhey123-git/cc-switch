@@ -10,6 +10,44 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 type Hash = [u8; 32];
+static HISTORY: OnceLock<Mutex<HashMap<Hash, Snapshot>>> = OnceLock::new();
+
+pub(crate) struct CacheAttempt {
+    key: Hash,
+    prepared_at: Instant,
+    previous: Option<Snapshot>,
+    accepted: bool,
+}
+
+impl CacheAttempt {
+    pub(crate) fn accept(mut self) {
+        self.accepted = true;
+    }
+}
+
+impl Drop for CacheAttempt {
+    fn drop(&mut self) {
+        if self.accepted {
+            return;
+        }
+        let Some(history) = HISTORY.get() else {
+            return;
+        };
+        let Ok(mut history) = history.lock() else {
+            return;
+        };
+        // A 502/failed attempt does not prove that its newest cache point was
+        // written. Restore the last accepted point, unless a newer concurrent
+        // request for this session has already replaced this snapshot.
+        if history.get(&self.key).map(|s| s.at) == Some(self.prepared_at) {
+            if let Some(previous) = self.previous.take() {
+                history.insert(self.key, previous);
+            } else {
+                history.remove(&self.key);
+            }
+        }
+    }
+}
 
 struct HashWriter(Sha256);
 impl Write for HashWriter {
@@ -167,12 +205,11 @@ pub(crate) fn inject_and_record(
     session: &str,
     body: &mut Value,
     config: &super::types::OptimizerConfig,
-) {
+) -> Option<CacheAttempt> {
     if session.is_empty() {
         super::cache_injector::inject(body, config);
-        return;
+        return None;
     }
-    static HISTORY: OnceLock<Mutex<HashMap<Hash, Snapshot>>> = OnceLock::new();
     let key = hash(&json!([provider, session]));
     let label = key[..6]
         .iter()
@@ -181,7 +218,7 @@ pub(crate) fn inject_and_record(
     let mut current = Snapshot::new(body);
     let Ok(mut history) = HISTORY.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
         super::cache_injector::inject(body, config);
-        return;
+        return None;
     };
     let anchor = history
         .get(&key)
@@ -205,12 +242,30 @@ pub(crate) fn inject_and_record(
             history.remove(&oldest);
         }
     }
-    history.insert(key, current);
+    let prepared_at = current.at;
+    let previous = history.insert(key, current);
+    Some(CacheAttempt {
+        key,
+        prepared_at,
+        previous,
+        accepted: false,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted_request(
+        provider: &str,
+        session: &str,
+        body: &mut Value,
+        config: &super::super::types::OptimizerConfig,
+    ) {
+        if let Some(attempt) = inject_and_record(provider, session, body, config) {
+            attempt.accept();
+        }
+    }
 
     fn optimizer() -> super::super::types::OptimizerConfig {
         super::super::types::OptimizerConfig {
@@ -224,7 +279,7 @@ mod tests {
     fn preserves_prior_write_point_beyond_twenty_block_lookback() {
         let mut body = json!({"model":"claude-opus-5-5","tools":[{"name":"read"}],"system":[{"type":"text","text":"stable"}],
             "messages":[{"role":"user","content":[{"type":"text","text":"long stable history"}]}]});
-        inject_and_record("fixture-anchor", "same-session", &mut body, &optimizer());
+        accepted_request("fixture-anchor", "same-session", &mut body, &optimizer());
         let mut next = body.clone();
         next["messages"][0]["content"][0]
             .as_object_mut()
@@ -244,7 +299,7 @@ mod tests {
                 .unwrap()
                 .push(json!({"type":"text","text":format!("appended {n}")}));
         }
-        inject_and_record("fixture-anchor", "same-session", &mut next, &optimizer());
+        accepted_request("fixture-anchor", "same-session", &mut next, &optimizer());
         let blocks = next["messages"][0]["content"].as_array().unwrap();
         assert!(blocks[0].get("cache_control").is_some());
         assert!(blocks.last().unwrap().get("cache_control").is_some());
@@ -270,10 +325,10 @@ mod tests {
     #[test]
     fn never_reuses_cross_session_or_thinking_breakpoint() {
         let mut one = json!({"model":"claude-opus-5-5","messages":[{"role":"user","content":[{"type":"text","text":"base"}]}]});
-        inject_and_record("fixture-isolation", "first-session", &mut one, &optimizer());
+        accepted_request("fixture-isolation", "first-session", &mut one, &optimizer());
         let mut two = json!({"model":"claude-opus-5-5","messages":[{"role":"user","content":[{"type":"text","text":"base"},{"type":"text","text":"new"}]},
             {"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"private"}]}]});
-        inject_and_record(
+        accepted_request(
             "fixture-isolation",
             "second-session",
             &mut two,
@@ -288,6 +343,49 @@ mod tests {
         assert!(two["messages"][1]["content"][0]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn failed_attempt_does_not_replace_last_accepted_cache_anchor() {
+        let fresh = || {
+            json!({"model":"claude-opus-5-5","tools":[{"name":"read"}],"system":[{"type":"text","text":"stable"}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"base"}]}]})
+        };
+        let mut initial = fresh();
+        accepted_request(
+            "fixture-failure",
+            "same-session",
+            &mut initial,
+            &optimizer(),
+        );
+        let mut failed = fresh();
+        for n in 0..45 {
+            failed["messages"][0]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"text","text":format!("tail {n}")}));
+        }
+        let attempt =
+            inject_and_record("fixture-failure", "same-session", &mut failed, &optimizer())
+                .unwrap();
+        drop(attempt);
+        let mut retry = fresh();
+        for n in 0..90 {
+            retry["messages"][0]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"text","text":format!("tail {n}")}));
+        }
+        accepted_request("fixture-failure", "same-session", &mut retry, &optimizer());
+        assert!(retry["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_some());
+        assert!(retry["messages"][0]["content"][45]
+            .get("cache_control")
+            .is_none());
+        assert!(retry["messages"][0]["content"][90]
+            .get("cache_control")
+            .is_some());
     }
 
     #[test]

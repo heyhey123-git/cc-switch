@@ -73,8 +73,11 @@ SSH 协作时，请求由服务器上的 Codex app-server 发起，因此服务�
 配置和密钥。`127.0.0.1:15721` 指服务器本机。这个部署不依赖 Windows CCS 或端口转发。
 已验证的目标是 Ubuntu 24.04 x86_64、Python 3.12；配置脚本要求 Python 3.11 或更高版本。
 
-从[同一发行页](https://github.com/heyhey123-git/cc-switch/releases/tag/v4.0.38-claude-fix.4)
-下载 Linux `.deb`、`cc-switch-proxy@.service`、`configure-linux-proxy.py` 和 `SHA256SUMS`。
+Linux 首轮二进制已在 Ubuntu 24.04 无桌面环境完成本地模拟验收。
+包含修复版 4 的 Linux 安装产物正在独立构建验收，发布后从
+[发行页](https://github.com/heyhey123-git/cc-switch/releases)下载 `.deb`、
+`cc-switch-proxy@.service`、`configure-linux-proxy.py` 和 `SHA256SUMS`。
+以下是对应部署流程，不能把 Windows MSI 当作 Linux 安装包。
 下载后先核对 SHA256，再安装；二进制仍链接 GTK/WebKit 运行库，但 headless 模式不初始化图形界面，
 无需桌面、DISPLAY 或 Xvfb。桌面版和 headless 服务不要同时占用同一用户的配置及端口。
 
@@ -383,6 +386,9 @@ developer 条目继续保留原指令权限。
 修复版 4 还对转换后的 Claude 工具数组按名称排序，避免相同工具仅因枚举顺序不同而造成全量重建。
 同一供应商、同一会话中，如果工具、system、设置和历史前缀未变，备用断点优先保留上次请求的
 消息断点，覆盖一次追加超过 20 个内容块的情况；仍最多四个断点，默认 5 分钟，不增加预热请求。
+HTTP 502、发送失败或成功响应校验失败时，不把该次尝试的新断点当作已写入位置，
+保留之前已接受请求的断点，供后续继续或重试使用。HTTP 200 仅表示响应已接受，
+真实缓存写入仍以返回用量和账单为准。
 跟踪保存在内存中，最多 128 个会话、每会话前 8192 块；进程重启或超出跟踪范围时使用常规断点策略。
 
 日志中的 `[CACHE_PREFIX]` 会显示 `tools_changed`、`system_changed`、`settings_changed`、

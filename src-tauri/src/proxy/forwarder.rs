@@ -1817,6 +1817,7 @@ impl RequestForwarder {
         // Codex→Anthropic: when the model name carries the [1m] marker, strip the
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
+        let mut codex_cache_attempt = None;
 
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
@@ -1917,7 +1918,7 @@ impl RequestForwarder {
             // otherwise system/tools/history are re-sent at full price every round,
             // inflating cost and first-token latency. The injector handles the
             // string→array `system` conversion and the new-breakpoint budget.
-            super::cache_diagnostics::inject_and_record(
+            codex_cache_attempt = super::cache_diagnostics::inject_and_record(
                 &provider.id,
                 &self.session_id,
                 &mut anthropic_body,
@@ -2410,6 +2411,7 @@ impl RequestForwarder {
                     opaque_state_request.as_ref(),
                 )
                 .await?;
+            if let Some(attempt) = codex_cache_attempt { attempt.accept(); }
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             Err(upstream_error(response).await?)

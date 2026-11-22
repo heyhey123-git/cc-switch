@@ -109,7 +109,7 @@ env_key = "CLAUDE_GATEWAY_API_KEY"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
-request_max_retries = 0
+request_max_retries = 3
 stream_max_retries = 0
 stream_idle_timeout_ms = 300000
 
@@ -135,9 +135,16 @@ Clash 必须绕过 `127.0.0.0/8`、`localhost` 和 `::1`，使 Codex 到 CCS 的
 
 关闭本地路由的自动故障转移。本文采用 HTTP SSE，
 将 provider 的 `supports_websockets` 设为 false，
-`request_max_retries` 和 `stream_max_retries` 设为 0，
+`request_max_retries` 设为 3，`stream_max_retries` 保持 0，
 `stream_idle_timeout_ms` 设为 300000。
-请求出错后由使用者决定是否重试；该配置不提供自动恢复。
+请求阶段遇到 HTTP 502 等 5xx 时，由 Codex 自动退避重试，最多重试 3 次（连同首次共 4 次）；
+达到上限仍失败就停止。这个原生设置也适用于其他符合条件的请求传输错误，不限于 502。
+HTTP 400 不会因此重试；已经开始输出后的 SSE 中断不自动重放，保留用户判断是否继续的机会。
+这能缓解短暂故障导致的中断，不会消除服务端持续返回 502 的原因，也不保证失败请求未在上游计费。
+本地实际 Codex 客户端检查通过：两次 502 后第三次成功、持续 502 仅发 4 次、400 仅发 1 次、
+已经输出部分内容的中断仅发 1 次；全部连接本地模拟服务，未调用付费模型。
+已有配置要在当前 Codex `config.toml` 及 CC Switch 对应供应商保存的 TOML 中同步修改，
+避免切换供应商后恢复成 0。更新后重启 Codex，确保现有会话也采用新配置；CC Switch 无需为此重启。
 如果多个模型共享这个 provider，传输及重试设置也会共同生效。
 
 ### 私有 CA 的 HTTPS 站点

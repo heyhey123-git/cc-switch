@@ -1,0 +1,61 @@
+name: Linux proxy build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: 3
+      NO_PROXY: 127.0.0.1,localhost,::1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.100.0'
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            libssl-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev patchelf file
+      - name: Install frontend dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.12.3 --activate
+          pnpm install --frozen-lockfile
+          pnpm build:renderer
+      - name: Native proxy and headless regression
+        working-directory: src-tauri
+        run: |
+          export CC_SWITCH_TEST_HOME="$(mktemp -d)"
+          cargo test --release --locked --features tauri/custom-protocol --lib proxy:: -- --test-threads=1
+          cargo test --release --locked --features tauri/custom-protocol --lib headless_proxy:: -- --test-threads=1
+      - name: Build production executable and Debian package
+        run: |
+          cargo build --release --locked --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
+          pnpm tauri bundle --bundles deb --no-sign --no-binary-patching --ci \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Verify no-display service startup and proxy conversion
+        run: python3 scripts/verify-linux-headless.py src-tauri/target/release/cc-switch
+      - name: Prepare verified artifacts
+        run: |
+          mkdir release-assets
+          cp src-tauri/target/release/bundle/deb/*.deb release-assets/CC-Switch-4.0.38-Claude-Fix.3-Linux-x64.deb
+          cp src-tauri/target/release/cc-switch release-assets/cc-switch-linux-x64
+          cp packaging/linux/cc-switch-proxy@.service release-assets/
+          cd release-assets
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cc-switch-linux-x64-headless
+          path: release-assets/*
+          if-no-files-found: error

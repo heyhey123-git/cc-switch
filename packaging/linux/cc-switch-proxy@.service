@@ -1,0 +1,20 @@
+[Unit]
+Description=CC Switch local model proxy for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=~
+ExecStart=/usr/bin/cc-switch --headless
+Environment=NO_PROXY=127.0.0.1,localhost,::1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

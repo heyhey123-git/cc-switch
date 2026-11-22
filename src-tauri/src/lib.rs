@@ -24,6 +24,8 @@ mod frontend_parity_tests;
 mod gemini_config;
 mod gemini_mcp;
 mod grok_config;
+#[cfg(target_os = "linux")]
+pub mod headless_proxy;
 pub mod hermes_config;
 mod host_open;
 mod init_status;

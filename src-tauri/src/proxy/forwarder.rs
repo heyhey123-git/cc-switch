@@ -1917,7 +1917,9 @@ impl RequestForwarder {
             // otherwise system/tools/history are re-sent at full price every round,
             // inflating cost and first-token latency. The injector handles the
             // string→array `system` conversion and the new-breakpoint budget.
-            super::cache_injector::inject(
+            super::cache_diagnostics::inject_and_record(
+                &provider.id,
+                &self.session_id,
                 &mut anthropic_body,
                 &codex_anthropic_cache_config(&self.optimizer_config),
             );

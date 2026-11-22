@@ -7,6 +7,14 @@ use serde_json::{json, Value};
 
 /// 在请求体关键位置注入 cache_control 断点
 pub fn inject(body: &mut Value, config: &OptimizerConfig) {
+    inject_with_anchor(body, config, None);
+}
+
+pub(crate) fn inject_with_anchor(
+    body: &mut Value,
+    config: &OptimizerConfig,
+    previous_anchor: Option<(usize, usize)>,
+) {
     if !config.enabled || !config.cache_injection {
         return;
     }
@@ -81,6 +89,25 @@ pub fn inject(body: &mut Value, config: &OptimizerConfig) {
                 }
             }
 
+            // Preserve the exact prior request's write point when that entire
+            // prefix is unchanged. A large appended tail can exceed the API's
+            // 20-block lookback even when no historical content changed.
+            if budget > 0 {
+                if let Some((message_index, block_index)) = previous_anchor {
+                    if let Some(block) = messages
+                        .get_mut(message_index)
+                        .and_then(|message| message.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|blocks| blocks.get_mut(block_index))
+                    {
+                        if inject_block_breakpoint(block) {
+                            budget -= 1;
+                            injected.push("msgs-previous-request");
+                        }
+                    }
+                }
+            }
+
             // (d) A second, older user anchor helps long tool-result turns where
             // the stable prefix falls outside Anthropic's 20-block lookback from
             // the newest breakpoint. Keep this best-effort and inside the 4-BP cap.
@@ -122,7 +149,15 @@ fn inject_message_breakpoint(message: &mut Value) -> bool {
     }) else {
         return false;
     };
-    if block.get("cache_control").is_some() {
+    inject_block_breakpoint(block)
+}
+
+fn inject_block_breakpoint(block: &mut Value) -> bool {
+    if matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    ) || block.get("cache_control").is_some()
+    {
         return false;
     }
     let Some(object) = block.as_object_mut() else {

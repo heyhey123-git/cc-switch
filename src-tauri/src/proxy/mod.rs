@@ -4,6 +4,7 @@
 
 pub mod body_filter;
 mod browser_guard;
+pub(crate) mod cache_diagnostics;
 pub mod cache_injector;
 pub mod circuit_breaker;
 mod classifier_guard;

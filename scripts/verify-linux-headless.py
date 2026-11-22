@@ -80,7 +80,7 @@ def check(name, condition):
 def request(body):
     client = http.client.HTTPConnection('127.0.0.1',port,timeout=15)
     try:
-        client.request('POST','/v1/responses',json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer '+token})
+        client.request('POST','/v1/responses',json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer '+token,'session_id':'headless-local-cache-fixture'})
         response = client.getresponse()
         raw = response.read()
         check('http_success',response.status==200)
@@ -119,6 +119,22 @@ try:
     check('notice_preserved_inside_tool_result',any(part.get('text')==resize for m in after['messages'] for block in m['content'] if block.get('type')=='tool_result' for part in block.get('content',[]) if isinstance(part,dict)))
     check('ordinary_developer_precedence','Stable developer instructions.' in json.dumps(after.get('system')))
     check('cache_usage_conversion',result['usage']['input_tokens_details']['cached_tokens']==1200)
+    upload_notice = '<image_resize_notice>\nImage 1 of 1 in the preceding user message was resized from 2944x1096 to 2048x762 pixels.\n</image_resize_notice>'
+    uploaded = copy.deepcopy(changed)
+    uploaded['input'].extend([
+        {'role':'assistant','content':'Previous image inspected.'},
+        {'role':'user','content':[{'type':'input_text','text':'Inspect another upload.'},{'type':'input_image','image_url':'data:image/png;base64,aGVsbG8='}]},
+        {'role':'developer','content':[{'type':'input_text','text':upload_notice}]}])
+    request(uploaded)
+    upload_capture = copy.deepcopy(captures[-1])
+    check('uploaded_user_image_system_stable',upload_capture.get('system')==after.get('system'))
+    check('uploaded_user_image_notice_preserved',any(block.get('text')==upload_notice for m in upload_capture['messages'] for block in m['content']))
+    grown = copy.deepcopy(uploaded)
+    grown['input'].append({'role':'user','content':[{'type':'input_text','text':'Appended block '+str(n)} for n in range(45)]})
+    request(grown)
+    grown_capture = captures[-1]
+    check('previous_request_anchor_retained_beyond_20_blocks',any(block.get('text')==upload_notice and 'cache_control' in block for m in grown_capture['messages'] for block in m['content']))
+    check('four_breakpoint_limit',sum('cache_control' in block for m in grown_capture['messages'] for block in m['content'])+sum('cache_control' in t for t in grown_capture.get('tools',[]))+sum('cache_control' in s for s in grown_capture.get('system',[]))==4)
     native = {'model':'ccs-native/gpt-local','input':[{'role':'user','content':'LOCAL_NATIVE'}], 'stream':False,'prompt_cache_key':'stable-key'}
     request(native)
     check('native_responses_unchanged',captures[-1]['input']==native['input'] and captures[-1]['prompt_cache_key']=='stable-key' and 'messages' not in captures[-1])

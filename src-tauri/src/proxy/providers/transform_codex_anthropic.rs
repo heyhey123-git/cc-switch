@@ -479,7 +479,7 @@ pub fn responses_request_to_anthropic(
     // Reuse the Codex tool context so function, namespace, custom, tool_search, and
     // dynamically loaded tools all receive stable flat names upstream.
     // 压缩回合只要一段摘要，不带工具，与 Codex 本地压缩请求同形。
-    let anth_tools: Vec<Value> = if tool_context.is_compaction_request() {
+    let mut anth_tools: Vec<Value> = if tool_context.is_compaction_request() {
         Vec::new()
     } else {
         tool_context
@@ -488,6 +488,10 @@ pub fn responses_request_to_anthropic(
             .filter_map(chat_tool_to_anthropic_tool)
             .collect()
     };
+    // Tool arrays have no execution order. Codex may rebuild the registry at a
+    // turn boundary; a different enumeration of identical definitions must not
+    // invalidate the entire Claude prefix. Names and schema contents stay intact.
+    anth_tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     let has_tools = !anth_tools.is_empty();
     if has_tools {
         result["tools"] = json!(anth_tools);
@@ -1937,6 +1941,28 @@ mod tests {
     }
 
     const IMAGE_RESIZE_NOTICE: &str = "<image_resize_notice>\nImage 1 of 1 in the preceding tool output was resized from 2368x3776 to 1247x1990 pixels.\n</image_resize_notice>";
+
+    #[test]
+    fn test_tool_enumeration_order_does_not_change_claude_prompt_prefix() {
+        let mut request = json!({"model":"claude-opus-5-5","instructions":"stable",
+        "input":[{"role":"user","content":"Use the selected tool."}],
+        "tool_choice":{"type":"function","name":"a_read"},
+        "tools":[
+            {"type":"function","name":"z_read","parameters":{"type":"object","properties":{"z":{"type":"string"}}}},
+            {"type":"namespace","name":"files","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
+            {"type":"function","name":"a_read","parameters":{"oneOf":[{"type":"string"},{"type":"object"}]}}
+        ]});
+        let first = responses_request_to_anthropic(request.clone(), 32000).unwrap();
+        for _ in 0..3 {
+            request["tools"].as_array_mut().unwrap().rotate_left(1);
+            let next = responses_request_to_anthropic(request.clone(), 32000).unwrap();
+            assert_eq!(first, next);
+        }
+        request["tools"].as_array_mut().unwrap().reverse();
+        let next = responses_request_to_anthropic(request, 32000).unwrap();
+        assert_eq!(first, next);
+        assert_eq!(first["tool_choice"]["name"], "a_read");
+    }
 
     #[test]
     fn test_uploaded_user_image_resize_notice_preserves_system_and_history_prefix() {

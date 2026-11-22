@@ -20,15 +20,16 @@ Codex 0.171.0-alpha.13 / Windows，以及 Codex 0.160.0 / Ubuntu 24.04 x86_64 �
 | 图片缩放通知 | 修复版 4 同时覆盖上传图片和工具图片、多图及分段通知，保留历史原位；普通 developer 指令仍进入 system |
 | 工具顺序和长尾追加 | Claude 工具定义按名称稳定排序；同一会话前缀未变时，保留上次请求的消息断点，避免追加超过 20 块后找不到旧断点 |
 | 缓存排查证据 | 输出工具、system、设置和历史前缀是否变化的指纹日志；不记录正文、图片、思考文本或密钥 |
-| Linux SSH 工作端 | `--headless` 在服务器本机提供代理，独立于 Windows，不需要图形桌面 |
+| Linux SSH 工作端 | 候选 `--headless` 路径在服务器本机提供代理，独立于 Windows；目前只评估，不正式部署 |
 | 压缩与压缩后继续调用工具 | 本地流程通过；未据此宣称百万 token 实网压缩性能已验证 |
-| 窗口访问 localhost:3000 | 已用包含前端资源的生产构建修复并实际打开窗口验证 |
+| 窗口访问 localhost:3000 | 生产构建内嵌前端资源；fix4 前端与已实际打开窗口验证的 fix3 一致，不依赖开发服务器 |
 | 压缩的 SSE 响应 | 在事件转换前增量解压 gzip、deflate（zlib）、br、zstd 及堆叠编码；不等待整条流结束 |
 | 私有 CA 站点 | 可在本机按 HTTPS origin 固定证书 SHA256；仍检查域名、有效期及 TLS 握手签名，拒绝重定向 |
 | 鉴权、真实缓存、图片、工具续接、摘要后继续 | 旧修复版曾通过 Sonnet 小额实网验收；本次升级只执行不计费的本地回归，其他部署按第 7 节验收 |
 
 Windows 客户端验收使用独立 Codex 配置目录和本地模拟上游，覆盖四模型五档、25 个工具、517828 字符合成上下文、图片、压缩与压缩后继续。
-修复版 4 额外核对上传图、工具图、工具顺序及长尾追加的实际转换前缀；原生回归及安装产物验收结果见对应发行页。
+修复版 4 通过 2001 项代理原生回归及 133 项安装版模拟检查，额外核对上传图、工具图、工具顺序、
+长尾追加和 502 后断点保留的实际转换前缀；本轮没有执行新的桌面窗口视觉检查。
 模拟缓存计数只能证明用量转换，
 不能证明付费上游真的缓存了输入。原生 Codex 也可以命中缓存。
 此前 Sonnet 5.5 / medium 小额实网验收已确认缓存、图片、普通工具续接和摘要后继续；
@@ -73,15 +74,19 @@ SSH 协作时，请求由服务器上的 Codex app-server 发起，因此服务�
 配置和密钥。`127.0.0.1:15721` 指服务器本机。这个部署不依赖 Windows CCS 或端口转发。
 已验证的目标是 Ubuntu 24.04 x86_64、Python 3.12；配置脚本要求 Python 3.11 或更高版本。
 
-Linux 首轮二进制已在 Ubuntu 24.04 无桌面环境完成本地模拟验收。
-包含修复版 4 的 Linux 安装产物正在独立构建验收，发布后从
-[发行页](https://github.com/heyhey123-git/cc-switch/releases)下载 `.deb`、
-`cc-switch-proxy@.service`、`configure-linux-proxy.py` 和 `SHA256SUMS`。
-以下是对应部署流程，不能把 Windows MSI 当作 Linux 安装包。
+Linux 接入目前只评估路径，暂不正式部署或发布 Linux 安装包。
+修复版 4 的 Linux x64 候选构建已通过 2001 项代理原生回归、无 DISPLAY 启停检查，
+以及 Ubuntu 24.04 上的 133 项本地模拟验收。
+独立 Codex app-server 实测覆盖 25 个工具、517828 字符历史、图片、压缩及压缩后继续，
+没有调用付费模型，也没有重启原有 Codex 进程。
+拟交付的文件为 `CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb`、`cc-switch-proxy@.service`、
+`configure-linux-proxy.py`、`SHA256SUMS` 和原始可执行文件 `cc-switch-linux-x64`。
+以下命令供评估部署流程，等待 Linux 方案确认及产物发布后再执行。
 下载后先核对 SHA256，再安装；二进制仍链接 GTK/WebKit 运行库，但 headless 模式不初始化图形界面，
 无需桌面、DISPLAY 或 Xvfb。桌面版和 headless 服务不要同时占用同一用户的配置及端口。
 
 ```bash
+sha256sum --ignore-missing -c SHA256SUMS
 sudo apt install ./CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb
 sudo install -m 644 cc-switch-proxy@.service /etc/systemd/system/
 ```
@@ -133,6 +138,14 @@ headless 服务提供代理功能，额度页面使用中转站面板；它不�
 让新启动的 app-server 读取服务器配置，再在模型菜单选择 Claude。
 排查服务使用 `journalctl -u "cc-switch-proxy@$(id -un)" -n 80 --no-pager`。
 更新 Linux 包时先等待服务没有在处理模型请求，再重启该服务。
+
+**已有代理的升级：**复用原服务、运行用户和配置目录，跳过上面的初始化、导入及新增服务步骤。
+先备份原二进制、服务启动脚本、数据库、Codex 配置和证书配置；确认 `/status` 中的
+`active_connections` 连续至少 3 秒为零，再停止 CCS 服务并替换二进制。
+服务入口使用 `cc-switch --headless`，继承原来的 HOME、CODEX_HOME 和配置目录；
+从启动脚本移除 Xvfb/DBus 图形包装，并检查旧服务的 `ExecStartPost` 是否仍依赖图形界面。
+重新加载 systemd 后只启动该 CCS 服务，核对 `/health`、`/status`、供应商和配置备份。
+启动失败时恢复原二进制与服务配置；不需要重启现有 Codex app-server。
 
 ## 3. 配置链路
 

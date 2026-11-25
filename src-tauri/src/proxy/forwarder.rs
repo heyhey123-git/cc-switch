@@ -2411,7 +2411,9 @@ impl RequestForwarder {
                     opaque_state_request.as_ref(),
                 )
                 .await?;
-            if let Some(attempt) = codex_cache_attempt { attempt.accept(); }
+            if let Some(attempt) = codex_cache_attempt {
+                attempt.accept();
+            }
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             Err(upstream_error(response).await?)

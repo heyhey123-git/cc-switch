@@ -222,6 +222,39 @@ pub struct OptimizerConfig {
     /// Cache 注入子开关（总开关开启后默认生效）
     #[serde(default = "default_true")]
     pub cache_injection: bool,
+    /// Cache TTL 策略：5m（默认）、1h、mixed（长历史 1h + 近期尾部 5m）
+    #[serde(default)]
+    pub cache_ttl_mode: CacheTtlMode,
+    /// mixed：上下文估算字符数达到该值才启用 1h 长锚点
+    #[serde(default = "default_cache_long_min_chars")]
+    pub cache_long_min_chars: usize,
+    /// mixed：长锚点后新增字符数达到该值才向后推进
+    #[serde(default = "default_cache_long_advance_chars")]
+    pub cache_long_advance_chars: usize,
+    /// mixed：长锚点之后保留给 5m 尾部的字符数
+    #[serde(default = "default_cache_tail_keep_chars")]
+    pub cache_tail_keep_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CacheTtlMode {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "mixed")]
+    Mixed,
+}
+
+fn default_cache_long_min_chars() -> usize {
+    150_000
+}
+fn default_cache_long_advance_chars() -> usize {
+    240_000
+}
+fn default_cache_tail_keep_chars() -> usize {
+    60_000
 }
 
 impl Default for OptimizerConfig {
@@ -230,6 +263,10 @@ impl Default for OptimizerConfig {
             enabled: false,
             thinking_optimizer: true,
             cache_injection: true,
+            cache_ttl_mode: CacheTtlMode::default(),
+            cache_long_min_chars: default_cache_long_min_chars(),
+            cache_long_advance_chars: default_cache_long_advance_chars(),
+            cache_tail_keep_chars: default_cache_tail_keep_chars(),
         }
     }
 }

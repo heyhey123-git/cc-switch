@@ -101,13 +101,14 @@ pub(super) fn should_strip_codex_openai_only_fields(
 /// Prompt caching is part of the Codex→Anthropic protocol bridge rather than an
 /// optional Bedrock optimizer. Codex requests do not contain Anthropic
 /// `cache_control`, so keep bridge caching on by default while still honoring the
-/// dedicated cache-injection switch. Injected breakpoints always use Anthropic's
-/// standard 5-minute TTL.
+/// dedicated cache-injection switch. Injected breakpoints use the configured TTL mode
+/// (default: Anthropic's standard 5-minute TTL).
 pub(super) fn codex_anthropic_cache_config(config: &OptimizerConfig) -> OptimizerConfig {
     OptimizerConfig {
         enabled: true,
         thinking_optimizer: false,
         cache_injection: config.cache_injection,
+        ..config.clone()
     }
 }
 

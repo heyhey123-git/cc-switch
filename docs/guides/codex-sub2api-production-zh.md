@@ -1,6 +1,6 @@
 # Codex + CC Switch + Sub2API：Claude 接入与运维
 
-核对日期：2026-11-22。验证组合：CC Switch v4.0.38 本分支、
+核对日期：2026-11-26。验证组合：CC Switch v4.0.42（上游 main）加本分支、
 Codex 0.171.0-alpha.13 / Windows，以及 Codex 0.160.0 / Ubuntu 24.04 x86_64 服务端。
 其他版本先按本文验收，再用于正式工作。
 本文和示例均不包含账户密钥、个人数据库或安装包。
@@ -39,11 +39,11 @@ Windows 客户端验收使用独立 Codex 配置目录和本地模拟上游，�
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.38-claude-fix.4/CC-Switch-4.0.38-Claude-Fix.4-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.42-claude-fix.7/CC-Switch-4.0.42-Claude-Fix.7-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
-这是个人 fork 的修复版，程序内版本显示 4.0.38，未使用官方签名证书。
+这是个人 fork 的修复版，程序内版本显示 4.0.42，未使用官方签名证书。
 安装包不包含 API Key、账户数据或供应商配置；安装后从第 3 节开始配置。
 安装官方新版可能覆盖本补丁，更新方式见第 9 节。
 

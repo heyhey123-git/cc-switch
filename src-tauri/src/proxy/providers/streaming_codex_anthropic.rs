@@ -485,10 +485,97 @@ impl AnthropicToResponsesState {
             })
     }
 
+    /// Content-free evidence of what the upstream actually cached for this response,
+    /// including the 5m/1h split when the gateway passes it through. A request's
+    /// `ttl` field alone does not prove a 1h write happened.
+    fn log_cache_usage(&self) {
+        let number = |value: Option<&Value>| value.and_then(Value::as_u64);
+        let read = number(self.anthropic_usage.get("cache_read_input_tokens")).unwrap_or(0);
+        let write = number(self.anthropic_usage.get("cache_creation_input_tokens")).unwrap_or(0);
+        let detail = self
+            .anthropic_usage
+            .get("cache_creation")
+            .and_then(Value::as_object);
+        let split = |key: &str| {
+            detail
+                .and_then(|object| number(object.get(key)))
+                .map_or_else(|| "n/a".to_string(), |value| value.to_string())
+        };
+        if read == 0 && write == 0 && detail.is_none() {
+            return;
+        }
+        log::info!(
+            "[CACHE_USAGE] model={} read={read} write={write} write_5m={} write_1h={} input={} output={}",
+            self.model,
+            split("ephemeral_5m_input_tokens"),
+            split("ephemeral_1h_input_tokens"),
+            number(self.anthropic_usage.get("input_tokens")).unwrap_or(0),
+            number(self.anthropic_usage.get("output_tokens")).unwrap_or(0),
+        );
+    }
+
+    /// A turn that hits `max_tokens` while still thinking produces only a reasoning
+    /// item. Codex then ends the turn with no message and no error, so the user sees
+    /// nothing and every "continue" burns the whole output budget again. Add a visible
+    /// explanation so the cause is never silent. Not used for network truncation,
+    /// compaction turns, or turns that already produced an answer or tool call.
+    fn truncated_thinking_notice(&mut self) -> Vec<Bytes> {
+        if self.stop_reason.as_deref() != Some("max_tokens")
+            || self.stream_truncated
+            || self.tool_context.is_compaction_request()
+        {
+            return Vec::new();
+        }
+        let has_answer = self.output_items.iter().any(|(_, item)| {
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") | None => false,
+                Some("message") => {
+                    item.get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        })
+                }
+                Some(_) => true,
+            }
+        });
+        if has_answer {
+            return Vec::new();
+        }
+        let used = self
+            .anthropic_usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        log::warn!(
+            "[Codex] Output limit reached while thinking (output_tokens={used}); no answer produced"
+        );
+        let text = format!(
+            "[CC Switch] 本轮输出已达到上限（{used} tokens），全部用于推理，模型还没有给出回答或工具调用。\
+             请提高该供应商的 maxOutputTokens，或降低推理强度后再发送“继续”。"
+        );
+        let output_index = self.next_output_index();
+        let item_id = response_message_item_id_indexed(&self.response_id, output_index);
+        let mut events = vec![
+            sse::message_item_added(output_index, &item_id),
+            sse::message_content_part_added(output_index, &item_id),
+            sse::output_text_delta(output_index, &item_id, &text),
+        ];
+        let (close, item) = sse::message_close(output_index, &item_id, &text);
+        events.extend(close);
+        self.output_items.push((output_index, item));
+        events
+    }
+
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
         }
+        self.log_cache_usage();
         let mut events = self.ensure_response_started();
 
         // Close out any blocks that are still open
@@ -501,6 +588,7 @@ impl AnthropicToResponsesState {
         for index in open {
             events.extend(self.close_block(index));
         }
+        events.extend(self.truncated_thinking_notice());
 
         if self.tool_context.is_compaction_request() {
             return self.finish_compaction(events);
@@ -1297,6 +1385,50 @@ mod tests {
         let merged = run(input).await;
         assert!(merged.contains("\"status\":\"incomplete\""));
         assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn test_thinking_only_max_tokens_adds_visible_notice() {
+        let thinking = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tk\",\"model\":\"claude\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":16384}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let merged = run(thinking).await;
+        assert!(merged.contains("\"type\":\"reasoning\""));
+        assert!(merged.contains("[CC Switch] 本轮输出已达到上限（16384 tokens）"));
+        assert!(merged.contains("\"status\":\"incomplete\""));
+        assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+
+        // A truncated answer, a tool call, or a normal end must not get the notice.
+        let answer = thinking.replace(
+            "event: message_delta",
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"real answer\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "event: message_delta"
+            ),
+        );
+        let merged = run(&answer).await;
+        assert!(merged.contains("real answer"));
+        assert!(!merged.contains("[CC Switch]"));
+        let normal = thinking.replace("max_tokens", "end_turn");
+        assert!(!run(&normal).await.contains("[CC Switch]"));
     }
 
     #[tokio::test]

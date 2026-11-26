@@ -25,6 +25,7 @@ pub mod hyper_client;
 pub(crate) mod json_canonical;
 pub mod log_codes;
 pub(crate) mod loopback_probe;
+pub(crate) mod max_tokens_rectifier;
 pub mod media_sanitizer;
 pub mod model_mapper;
 pub mod opaque_state_rectifier;

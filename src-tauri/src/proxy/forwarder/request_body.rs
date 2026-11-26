@@ -112,6 +112,20 @@ pub(super) fn codex_anthropic_cache_config(config: &OptimizerConfig) -> Optimize
     }
 }
 
+/// A Codex compaction turn is a one-shot request: the history it writes is replaced
+/// by the summary right afterwards, so nothing reads that cache again. Paying the
+/// 1h write price (2x) for it is wasted; use the standard 5m TTL for these turns.
+pub(super) fn codex_anthropic_cache_config_for_turn(
+    config: &OptimizerConfig,
+    compaction_turn: bool,
+) -> OptimizerConfig {
+    let mut config = codex_anthropic_cache_config(config);
+    if compaction_turn {
+        config.cache_ttl_mode = super::super::types::CacheTtlMode::FiveMinutes;
+    }
+    config
+}
+
 pub(super) fn apply_local_proxy_body_overrides(
     body: &mut Value,
     overrides: &LocalProxyRequestOverrides,

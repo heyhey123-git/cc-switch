@@ -40,6 +40,16 @@ fn openai_cache_write_tokens(usage: &Value) -> u32 {
         .unwrap_or(0) as u32
 }
 
+/// Codex Responses 形态 usage 里的 1 小时缓存写入（`cache_write_tokens` 的子集，
+/// 由 Anthropic 桥接保留；上限不超过总写入量）
+fn codex_cache_write_1h_tokens(usage: &Value, cache_write_tokens: u32) -> u32 {
+    usage
+        .pointer("/input_tokens_details/cache_write_1h_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(cache_write_tokens as u64) as u32
+}
+
 /// Claude usage 中按 1 小时 TTL 写入的缓存 token（`cache_creation_input_tokens` 的子集）
 pub(crate) fn claude_cache_creation_1h_tokens(usage: &Value) -> u32 {
     usage
@@ -343,7 +353,7 @@ impl TokenUsage {
             output_tokens: output_tokens? as u32,
             cache_read_tokens: cached_tokens,
             cache_creation_tokens: cache_write_tokens,
-            cache_creation_1h_tokens: 0,
+            cache_creation_1h_tokens: codex_cache_write_1h_tokens(usage, cache_write_tokens),
             model,
             message_id: response_id(body, "id"),
         })
@@ -1442,5 +1452,31 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.cache_creation_tokens, 0);
         assert_eq!(usage.model, None);
+    }
+
+    #[test]
+    fn codex_response_usage_reads_one_hour_cache_write_split() {
+        let body = json!({"id":"resp_1","model":"claude-opus-5-5","usage":{
+            "input_tokens":1710,"output_tokens":5,
+            "input_tokens_details":{"cached_tokens":1000,"cache_write_tokens":700,"cache_write_1h_tokens":600}}});
+        let usage = TokenUsage::from_codex_response(&body).unwrap();
+        assert_eq!(usage.cache_creation_tokens, 700);
+        assert_eq!(usage.cache_creation_1h_tokens, 600);
+        let bigger = json!({"usage":{"input_tokens":10,"output_tokens":1,
+            "input_tokens_details":{"cache_write_tokens":50,"cache_write_1h_tokens":900}}});
+        assert_eq!(
+            TokenUsage::from_codex_response(&bigger)
+                .unwrap()
+                .cache_creation_1h_tokens,
+            50
+        );
+        let plain = json!({"usage":{"input_tokens":10,"output_tokens":1,
+            "input_tokens_details":{"cache_write_tokens":50}}});
+        assert_eq!(
+            TokenUsage::from_codex_response(&plain)
+                .unwrap()
+                .cache_creation_1h_tokens,
+            0
+        );
     }
 }

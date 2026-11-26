@@ -164,7 +164,7 @@ Codex --Responses / HTTP SSE--> CC Switch 127.0.0.1:15721
 | 上游格式 | Anthropic Messages |
 | 认证字段 | 按商家要求；Sub2API 通常选择 ANTHROPIC_AUTH_TOKEN / Authorization |
 | 模拟 Claude Code | 关闭 |
-| 最大输出 tokens | 16384 |
+| 最大输出 tokens | 64000 |
 | 默认模型 | claude-sonnet-5-5 |
 | 默认推理档位 | medium |
 
@@ -195,7 +195,7 @@ wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
 request_max_retries = 3
-stream_max_retries = 0
+stream_max_retries = 3
 stream_idle_timeout_ms = 300000
 
 [model_providers.claude_gateway.capabilities]
@@ -210,7 +210,7 @@ remote_compaction = "unsupported"
   "apiFormat": "anthropic",
   "apiKeyField": "ANTHROPIC_AUTH_TOKEN",
   "impersonateClaudeCode": false,
-  "maxOutputTokens": 16384
+  "maxOutputTokens": 64000
 }
 ```
 
@@ -220,14 +220,20 @@ Clash 必须绕过 `127.0.0.0/8`、`localhost` 和 `::1`，使 Codex 到 CCS 的
 
 关闭本地路由的自动故障转移。本文采用 HTTP SSE，
 将 provider 的 `supports_websockets` 设为 false，
-`request_max_retries` 设为 3，`stream_max_retries` 保持 0，
+`request_max_retries` 和 `stream_max_retries` 都设为 3，
 `stream_idle_timeout_ms` 设为 300000。
 请求阶段遇到 HTTP 502 等 5xx 时，由 Codex 自动退避重试，最多重试 3 次（连同首次共 4 次）；
 达到上限仍失败就停止。这个原生设置也适用于其他符合条件的请求传输错误，不限于 502。
-HTTP 400 不会因此重试；已经开始输出后的 SSE 中断不自动重放，保留用户判断是否继续的机会。
-这能缓解短暂故障导致的中断，不会消除服务端持续返回 502 的原因，也不保证失败请求未在上游计费。
-本地实际 Codex 客户端检查通过：两次 502 后第三次成功、持续 502 仅发 4 次、400 仅发 1 次、
-已经输出部分内容的中断仅发 1 次；全部连接本地模拟服务，未调用付费模型。
+HTTP 400 不会因此重试。
+流已经开始后被中断（例如上游连接中途断开、`unexpected EOF during chunk size line`），
+CC Switch 会向 Codex 返回 `response.failed`，Codex 按 `stream_max_retries` 重新发送整个请求，
+同样最多重试 3 次。`stream_max_retries` 不要设为 0：设为 0 时第一次流中断就会直接结束当前回合。
+重试会重新提交整段上下文；上游可能已经为被中断的那次请求计费，所以不要把次数设得过大。
+这能缓解短暂故障导致的中断，不会消除服务端持续返回 502 或断流的原因，也不保证失败请求未在上游计费。
+本地实际 Codex 客户端检查通过（全部连接本地模拟服务，未调用付费模型）：
+两次 502 后第三次成功、持续 502 仅发 4 次、400 仅发 1 次；
+`stream_max_retries = 0` 时流中断仅发 1 次，设为 3 时两次 `response.failed` 或两次连接截断后第三次成功，
+持续失败最多发 4 次。
 已有配置要在当前 Codex `config.toml` 及 CC Switch 对应供应商保存的 TOML 中同步修改，
 避免切换供应商后恢复成 0。更新后重启 Codex，确保现有会话也采用新配置；CC Switch 无需为此重启。
 如果多个模型共享这个 provider，传输及重试设置也会共同生效。
@@ -289,10 +295,10 @@ try {
 
 | 模型 ID | 建议默认档位 | 本方案上下文 | 本方案单次输出上限 |
 | --- | --- | --- | --- |
-| claude-fable-5-2 | medium | 1000000 | 16384 |
-| claude-opus-5-5 | medium | 1000000 | 16384 |
-| claude-sonnet-5-5 | medium | 1000000 | 16384 |
-| claude-haiku-5-5 | medium | 1000000 | 16384 |
+| claude-fable-5-2 | medium | 1000000 | 64000 |
+| claude-opus-5-5 | medium | 1000000 | 64000 |
+| claude-sonnet-5-5 | medium | 1000000 | 64000 |
+| claude-haiku-5-5 | medium | 1000000 | 64000 |
 
 在供应商模型映射中逐项填写模型 ID、上下文窗口和五档推理。
 下面以 Sonnet 为例，字段属于供应商 `settingsConfig.modelCatalog`，不是 Codex 原始 catalog。
@@ -361,7 +367,7 @@ Content-Type: application/json
 ```json
 {
   "model": "claude-sonnet-5-5",
-  "max_tokens": 16384,
+  "max_tokens": 64000,
   "thinking": { "type": "adaptive" },
   "output_config": { "effort": "medium" },
   "system": [
@@ -396,6 +402,15 @@ TTL 或账号路由，需要结合商家的请求日志确认最终发给上游�
 通知只含固定格式的数字尺寸数据时才按历史元数据处理；夹带普通指令、图片或未知内容的
 developer 条目继续保留原指令权限。
 
+修复版 6 修正了另一个会让整段缓存失效的来源：Codex 桌面版会在较晚的用户回合开头重复发出
+`codex_apps_client_time_context`（时区和日期）developer 条目。旧版把每一条都提升到全局 system，
+system 一变，其后的 tools、历史消息缓存全部失效，包括 1 小时缓存。
+本地日志中 58 次 `system_changed=true` 里，26 次与这类条目的出现时间在 3 秒内吻合，
+其中一次是约 60 万 token 的会话在 01:24 的重写。
+现在只有对话开始之后、且完整匹配该固定格式的时间条目才保留在历史原位（并入对应用户回合；
+工具续接时放进工具结果文字内）。对话开始之前的开头条目仍属于稳定的基础提示，继续放在 system；
+夹带其他指令、格式不完全一致的条目继续保留 developer 指令权限。
+
 修复版 4 还对转换后的 Claude 工具数组按名称排序，避免相同工具仅因枚举顺序不同而造成全量重建。
 同一供应商、同一会话中，如果工具、system、设置和历史前缀未变，备用断点优先保留上次请求的
 消息断点，覆盖一次追加超过 20 个内容块的情况；仍最多四个断点，默认 5 分钟，不增加预热请求。
@@ -409,25 +424,45 @@ HTTP 502、发送失败或成功响应校验失败时，不把该次尝试的新
 不保存提示正文、工具参数、图片、思考内容或密钥。`initial=true` 表示本进程尚无前一请求可对比。
 它证明本地前缀是否变化，不代表服务端确认缓存写入成功。
 
-16,384 是本方案配置的单次总输出上限，包含 thinking，不是模型的上下文上限。
-xhigh 可能将这部分额度全部用在思考上，出现 `max_output_tokens` / incomplete；
-自动目标续接会再发下一轮。不要把这种相邻现象直接认定为缓存失效原因，
-应同时核对前缀日志和用量。提高输出上限也会提高单次费用风险，不为排查缓存自动提高。
+64,000 是本方案配置的单次总输出上限（修复版 6 起；此前为 16,384），包含 thinking，
+不是模型的上下文上限。官方资料列出的四个型号最大输出为 128K，64,000 在其范围内。
+上限太小会在 xhigh 下被思考用满：Opus 在一次大型重新设计任务上连续两次恰好输出 16,384 token、
+全部是推理，没有回答，回合在 Codex 里静默结束。不要把这种相邻现象直接认定为缓存失效原因，
+应同时核对前缀日志和用量。
+
+修复版 6 起，如果一个回合在思考阶段就用完了输出上限（`stop_reason=max_tokens`），
+没有任何回答或工具调用，CC Switch 会在回复里追加一条以 `[CC Switch]` 开头的说明，
+并写一行 `Output limit reached while thinking` 警告日志。以前这种回合在 Codex 里
+静默结束，界面上什么都没有，再发“继续”会重复同样的结果，每次白花一整个输出额度。
+看到这条说明时，有两种处理：降低该对话的推理强度（xhigh → high）；或提高该供应商的
+`maxOutputTokens`。Anthropic 对 xhigh / max 档位建议给足输出额度（从 64000 起步）。
+提高上限只会让真正用到的部分多花钱，但一次失控推理的最坏费用随上限成比例增加，
+例如 Opus 输出按 $20/百万 token，16,384 最坏约 $0.33，64,000 最坏约 $1.28。
+上限必须不超过上游模型的最大输出，否则请求会被 400 拒绝。万一某个模型的上限更低，
+上游的 400 会写明数值（`max_tokens: N > M, which is the maximum allowed number of output tokens`），
+CC Switch 会记录这个数值并只重试一次，之后同一供应商的请求都不超过它（日志 `RECT-020`）；
+400 校验错误不计费。重启 CC Switch 后记录清空，需要时再按同样方式学到。
 已有会话中旧尺寸提示的位置在升级时会改变，首轮可能重新写入大段缓存；
 先用短会话核对新版本，不要主动重放长历史或反复预热。修复本地前缀变化不代表每次请求一定命中远端缓存。
 
 查看 `cache_read_input_tokens`、`cache_creation_input_tokens`；
 Codex 对应 `cachedInputTokens`、`cacheWriteInputTokens`。
 Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单价计算。
-1 小时缓存写入与 5 分钟写入价格不同，本分支的用量转换没有完整保留两种 TTL 的细分。
-本地成本看板是估算，最终与商家扣量对账。
+1 小时缓存写入（基础输入价 2 倍）与 5 分钟写入（1.25 倍）价格不同。修复版 6 起，
+Codex 转 Anthropic 的路径保留上游返回的 `cache_creation.ephemeral_1h_input_tokens`
+细分，本地成本按两种价格分别计算；日志里的 `[CACHE_USAGE]` 行给出每次响应的读取、
+总写入、`write_5m`、`write_1h`，`n/a` 表示上游没有返回细分。旧版本把 1 小时写入按 5 分钟价估算，
+金额偏低。本地成本看板仍是估算，最终与商家扣量对账。
+冷启动（缓存已过期或第一次请求）时，混合模式会把大部分上下文按 1 小时写入，
+这一次比全 5 分钟多付约 60% 的写入费；它只对 5 到 60 分钟的停顿有保护作用，
+空闲超过 1 小时缓存照样全部失效。
 
 ### 缓存时长：5m / mixed / 1h
 
-默认仍为五分钟。设置里的“Claude cache TTL”可切换：
+默认为 mixed。设置里的“Claude 缓存时长”可切换：
 
-- 5m：默认，行为与旧版一致。
-- mixed：上下文估算达到 15 万字符后，system（覆盖 tools）和一个长历史锚点用 1h，近期尾部用 5m；一小时断点始终排在五分钟断点之前，总数不超过 4 个。长锚点只在新增内容超过阈值（默认 24 万字符）后才向后推进，失败或取消的请求会回滚。
+- 5m：全部五分钟，行为与旧版一致。
+- mixed（默认）：上下文估算达到 15 万字符后，system（覆盖 tools）和一个长历史锚点用 1h，近期尾部用 5m；一小时断点始终排在五分钟断点之前，总数不超过 4 个。长锚点只在新增内容超过阈值（默认 24 万字符）后才向后推进，失败或取消的请求会回滚。
 - 1h：所有注入断点均为一小时。
 
 注意：1h 写入按基础输入价 2 倍计费（5m 为 1.25 倍）；mixed 在长锚点推进时会对新纳入段支付一次 1h 写入。请求里的 ttl 不能证明真实写入，须看上游 usage 的 1h/5m 写入字段和站点账单；CCS 本地面板对 1h 写入按 5m 价格估算，会偏低。站点若强制改写 TTL，实际结果以站点为准。
@@ -531,7 +566,7 @@ Codex 总输入包含缓存部分，不应将总输入全部按新鲜输入单�
 2. 固定一个 2K～4K token 的文本前缀，同一 Sonnet 模型、同一会话和档位，
    输出限制为 32 token，串行发送两次，间隔在缓存有效期内。
    两次请求共用相同前缀。为这个独立验收供应商暂设 `maxOutputTokens=32`，
-   验收后恢复 16384；该元数据会覆盖请求体自己的输出限制。
+   验收后恢复原值；该元数据会覆盖请求体自己的输出限制。
 3. 核对第二次响应的缓存读取是否覆盖前次大部分固定前缀，
    并对照前后额度差额。仅看到请求含缓存标记不能记为命中。
 4. 再附加一张小图片，完成一次短工具调用与手动压缩；

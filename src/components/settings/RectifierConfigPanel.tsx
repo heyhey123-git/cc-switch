@@ -22,6 +22,7 @@ export function RectifierConfigPanel() {
     enabled: false,
     thinkingOptimizer: true,
     cacheInjection: true,
+    cacheTtlMode: "mixed",
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -216,7 +217,7 @@ export function RectifierConfigPanel() {
               </div>
               <select
                 className="rounded-md border border-border-default bg-transparent px-2 py-1 text-sm"
-                value={optimizerConfig.cacheTtlMode ?? "5m"}
+                value={optimizerConfig.cacheTtlMode ?? "mixed"}
                 onChange={(e) =>
                   handleOptimizerChange({
                     cacheTtlMode: e.target.value as "5m" | "1h" | "mixed",

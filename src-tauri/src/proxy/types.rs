@@ -238,11 +238,11 @@ pub struct OptimizerConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CacheTtlMode {
-    #[default]
     #[serde(rename = "5m")]
     FiveMinutes,
     #[serde(rename = "1h")]
     OneHour,
+    #[default]
     #[serde(rename = "mixed")]
     Mixed,
 }

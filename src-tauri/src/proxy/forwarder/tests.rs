@@ -1082,6 +1082,30 @@ fn codex_anthropic_cache_is_default_on_but_honors_sub_switch() {
 }
 
 #[test]
+fn codex_compaction_turn_uses_five_minute_cache_in_every_mode() {
+    use crate::proxy::types::CacheTtlMode;
+    for mode in [
+        CacheTtlMode::Mixed,
+        CacheTtlMode::OneHour,
+        CacheTtlMode::FiveMinutes,
+    ] {
+        let config = OptimizerConfig {
+            cache_ttl_mode: mode,
+            ..OptimizerConfig::default()
+        };
+        // Ordinary turns keep the configured mode; the one-shot compaction turn never
+        // pays the 1h write price.
+        assert_eq!(
+            codex_anthropic_cache_config_for_turn(&config, false).cache_ttl_mode,
+            mode
+        );
+        let compaction = codex_anthropic_cache_config_for_turn(&config, true);
+        assert_eq!(compaction.cache_ttl_mode, CacheTtlMode::FiveMinutes);
+        assert!(compaction.enabled && compaction.cache_injection);
+    }
+}
+
+#[test]
 fn invalid_client_history_is_not_retryable() {
     let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
     let provider = test_provider_with_type(None);

@@ -256,7 +256,7 @@ pub fn get_current_proxy_url() -> Option<String> {
 }
 
 /// 两种客户端共用的参数
-fn base_builder() -> reqwest::ClientBuilder {
+pub(super) fn base_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -378,7 +378,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     build_client_from(base_builder(), proxy_url)
 }
 
-fn build_client_from(
+pub(super) fn build_client_from(
     mut builder: reqwest::ClientBuilder,
     proxy_url: Option<&str>,
 ) -> Result<Client, String> {

@@ -544,7 +544,9 @@
         "thinkingOptimizer": "Thinking 최적화",
         "thinkingOptimizerDescription": "Opus/Sonnet에는 Adaptive Thinking을 자동으로 활성화하고 이전 모델에는 Extended Thinking을 추가합니다.",
         "cacheInjection": "캐시 주입",
-        "cacheInjectionDescription": "중복 토큰 청구를 줄이기 위해 주요 위치에 표준 5분 캐시 중단점을 자동으로 삽입합니다."
+        "cacheInjectionDescription": "중복 토큰 청구를 줄이기 위해 주요 위치에 표준 5분 캐시 중단점을 자동으로 삽입합니다.",
+        "cacheTtlMode": "Claude cache TTL",
+        "cacheTtlModeDescription": "5m: standard. 1h: every breakpoint one hour (2x write price). Mixed: long history 1h, recent tail 5m."
       },
       "logConfig": {
         "title": "애플리케이션 진단 로그",

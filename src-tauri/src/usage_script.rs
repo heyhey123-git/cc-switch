@@ -296,16 +296,22 @@ async fn send_http_request(config: &RequestConfig, timeout_secs: u64) -> Result<
         })?;
     }
 
-    // 使用不跟随重定向的客户端（本机地址直连，其余继承全局代理配置）：
+    // 私有 CA 站点按 HTTPS origin 固定叶证书 SHA256（见 proxy::tls_pins），该客户端不跟随重定向；
+    // 其余请求使用上游的不跟随重定向客户端（本机地址直连，其余继承全局代理配置）：
     // 1. 防止 301/302/307/308 重定向绕过 validate_request_url 的同源与 HTTPS 限制（SSRF）；
     // 2. 防止跨主机或降级重定向泄露自定义认证头（如 x-api-key）与 POST 请求体。
-    let client = crate::proxy::http_client::no_redirect_for_url(&config.url).map_err(|e| {
-        AppError::localized(
-            "usage_script.http_client_failed",
-            format!("创建 HTTP 客户端失败: {e}"),
-            format!("Failed to build HTTP client: {e}"),
-        )
-    })?;
+    let client = match crate::proxy::tls_pins::client_for_url(&config.url)
+        .map_err(|e| AppError::Message(format!("TLS pin configuration: {e}")))?
+    {
+        Some(pinned) => pinned,
+        None => crate::proxy::http_client::no_redirect_for_url(&config.url).map_err(|e| {
+            AppError::localized(
+                "usage_script.http_client_failed",
+                format!("创建 HTTP 客户端失败: {e}"),
+                format!("Failed to build HTTP client: {e}"),
+            )
+        })?,
+    };
     // 约束超时范围，防止异常配置导致长时间阻塞（最小 2 秒，最大 30 秒）
     let request_timeout = std::time::Duration::from_secs(timeout_secs.clamp(2, 30));
 

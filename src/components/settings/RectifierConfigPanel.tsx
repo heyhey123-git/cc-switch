@@ -22,6 +22,7 @@ export function RectifierConfigPanel() {
     enabled: false,
     thinkingOptimizer: true,
     cacheInjection: true,
+    cacheTtlMode: "5m",
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -199,6 +200,34 @@ export function RectifierConfigPanel() {
                   handleOptimizerChange({ cacheInjection: checked })
                 }
               />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label>
+                  {t("settings.advanced.optimizer.cacheTtlMode", {
+                    defaultValue: "Claude cache TTL",
+                  })}
+                </Label>
+                <p className="text-xs text-fg-2">
+                  {t("settings.advanced.optimizer.cacheTtlModeDescription", {
+                    defaultValue:
+                      "5m: default. 1h: every breakpoint one hour (2x write price). Mixed: long history 1h, recent tail 5m.",
+                  })}
+                </p>
+              </div>
+              <select
+                className="rounded-md border border-border-default bg-transparent px-2 py-1 text-sm"
+                value={optimizerConfig.cacheTtlMode ?? "5m"}
+                onChange={(e) =>
+                  handleOptimizerChange({
+                    cacheTtlMode: e.target.value as "5m" | "1h" | "mixed",
+                  })
+                }
+              >
+                <option value="5m">5m</option>
+                <option value="mixed">mixed</option>
+                <option value="1h">1h</option>
+              </select>
             </div>
           </div>
         </div>

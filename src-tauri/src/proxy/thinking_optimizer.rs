@@ -80,6 +80,7 @@ pub(crate) fn uses_adaptive_thinking(model: &str) -> bool {
         "mythos-5",
         "mythos-preview",
         "sonnet-5",
+        "haiku-5-5",
         "opus-5",
         "opus-4-8",
         "opus-4-7",
@@ -101,6 +102,7 @@ pub(crate) fn adaptive_thinking_is_default(model: &str) -> bool {
         "mythos-preview",
         "opus-5",
         "sonnet-5",
+        "haiku-5-5",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -123,6 +125,23 @@ pub(crate) fn accepts_unsigned_tool_history(model: &str) -> bool {
     ["opus-5-5", "sonnet-5-5"]
         .iter()
         .any(|needle| normalized.contains(needle))
+}
+
+/// Keep the native xhigh tier only on models that advertise it. Older models
+/// retain their existing max-tier fallback instead of receiving an invalid value.
+pub(crate) fn supports_xhigh_effort(model: &str) -> bool {
+    let normalized = normalize_model_name(model);
+    [
+        "fable-5",
+        "mythos-5",
+        "opus-5",
+        "opus-4-8",
+        "opus-4-7",
+        "sonnet-5",
+        "haiku-5-5",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn normalize_model_name(model: &str) -> String {
@@ -157,6 +176,7 @@ mod tests {
             enabled: true,
             thinking_optimizer: true,
             cache_injection: true,
+            ..OptimizerConfig::default()
         }
     }
 
@@ -165,6 +185,7 @@ mod tests {
             enabled: true,
             thinking_optimizer: false,
             cache_injection: true,
+            ..OptimizerConfig::default()
         }
     }
 
@@ -190,6 +211,7 @@ mod tests {
     fn current_generation_models_use_adaptive_thinking() {
         for model in [
             "claude-sonnet-5",
+            "claude-haiku-5-5",
             "anthropic/claude-fable-5",
             "claude-mythos-5",
             "claude-opus-5",
@@ -204,6 +226,7 @@ mod tests {
             "claude-opus-5-5",
             "claude-fable-5-1",
             "claude-mythos-5-1",
+            "claude-haiku-5-5",
         ] {
             assert!(adaptive_thinking_is_default(model), "model={model}");
         }
@@ -226,6 +249,7 @@ mod tests {
         for model in ["claude-fable-5-1", "claude-opus-5", "claude-sonnet-5"] {
             assert!(!accepts_unsigned_tool_history(model), "model={model}");
         }
+        assert!(!uses_adaptive_thinking("claude-haiku-4-5"));
     }
 
     #[test]

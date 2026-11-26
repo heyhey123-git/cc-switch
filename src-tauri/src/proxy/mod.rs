@@ -4,6 +4,7 @@
 
 pub mod body_filter;
 mod browser_guard;
+pub(crate) mod cache_diagnostics;
 pub mod cache_injector;
 pub mod circuit_breaker;
 mod classifier_guard;
@@ -25,6 +26,7 @@ pub mod hyper_client;
 pub(crate) mod json_canonical;
 pub mod log_codes;
 pub(crate) mod loopback_probe;
+pub(crate) mod max_tokens_rectifier;
 pub mod media_sanitizer;
 pub mod model_mapper;
 pub mod opaque_state_rectifier;
@@ -39,6 +41,7 @@ pub(crate) mod switch_lock;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
+pub(crate) mod tls_pins;
 pub(crate) mod tool_media;
 pub(crate) mod types;
 pub(crate) mod upstream_guard;

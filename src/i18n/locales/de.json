@@ -544,7 +544,9 @@
         "thinkingOptimizer": "Thinking-Optimierung",
         "thinkingOptimizerDescription": "Aktiviert für Opus/Sonnet automatisch Adaptive Thinking und fügt für ältere Modelle Extended Thinking ein",
         "cacheInjection": "Cache-Injektion",
-        "cacheInjectionDescription": "Fügt an Schlüsselstellen automatisch standardmäßige 5-Minuten-Cache-Breakpoints ein, um doppelt abgerechnete Token zu reduzieren"
+        "cacheInjectionDescription": "Fügt an Schlüsselstellen automatisch standardmäßige 5-Minuten-Cache-Breakpoints ein, um doppelt abgerechnete Token zu reduzieren",
+        "cacheTtlMode": "Claude cache TTL",
+        "cacheTtlModeDescription": "5m: standard. 1h: every breakpoint one hour (2x write price). Mixed: long history 1h, recent tail 5m."
       },
       "logConfig": {
         "title": "Diagnoseprotokolle der Anwendung",

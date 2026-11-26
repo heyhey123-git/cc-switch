@@ -1301,7 +1301,9 @@ async fn handle_responses_for_app(
     let codex_upstream_format = result.codex_upstream_format;
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
-    let response = result.response;
+    // Some gateways compress SSE even when the request asks for identity. Decode
+    // before any Responses/Chat/Anthropic event parser or entity-header rewrite.
+    let response = super::content_encoding::decode_sse_response(result.response)?;
 
     if codex_upstream_format == Some(CodexUpstreamFormat::Anthropic) {
         return handle_codex_anthropic_to_responses_transform(
@@ -1379,7 +1381,7 @@ async fn handle_responses_for_app(
 
 /// 在上游 SSE 里补发或改写事件的流式响应：响应体和上游的不一样长了，除了逐跳头还要去掉
 /// Content-Length 等实体头，否则客户端读到上游声明的长度就停，补上的事件一个都收不到。
-/// （SSE 路径请求上游时强制 `accept-encoding: identity`，去掉 Content-Encoding 也安全。）
+/// SSE 在分派到改写器之前已按 Content-Encoding 流式解压。
 fn rewritten_sse_response_builder(
     status: StatusCode,
     upstream_headers: &axum::http::HeaderMap,

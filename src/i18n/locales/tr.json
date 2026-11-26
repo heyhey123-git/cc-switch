@@ -544,7 +544,9 @@
         "thinkingOptimizer": "Düşünme Optimizasyonu",
         "thinkingOptimizerDescription": "Opus/Sonnet için Uyarlanabilir Düşünmeyi otomatik olarak etkinleştirin ve eski modeller için Genişletilmiş Düşünmeyi enjekte edin",
         "cacheInjection": "Önbellek Enjeksiyonu",
-        "cacheInjectionDescription": "Mükerrer token faturalandırmasını azaltmak için anahtar konumlara standart 5 dakikalık önbellek kesme noktalarını otomatik olarak enjekte edin"
+        "cacheInjectionDescription": "Mükerrer token faturalandırmasını azaltmak için anahtar konumlara standart 5 dakikalık önbellek kesme noktalarını otomatik olarak enjekte edin",
+        "cacheTtlMode": "Claude cache TTL",
+        "cacheTtlModeDescription": "5m: standard. 1h: every breakpoint one hour (2x write price). Mixed: long history 1h, recent tail 5m."
       },
       "logConfig": {
         "title": "Uygulama Tanılama Günlükleri",

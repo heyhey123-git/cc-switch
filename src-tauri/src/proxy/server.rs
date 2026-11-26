@@ -1077,6 +1077,123 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         mock_handle.abort();
     }
 
+    /// A provider cap above what the Anthropic upstream accepts must not break every
+    /// request: the 400 states the ceiling, the proxy retries once under it, and later
+    /// requests go straight out under it.
+    #[tokio::test]
+    async fn codex_anthropic_output_limit_rejection_is_learned_and_retried() {
+        const UPSTREAM_SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":3}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"limit ok\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let handler = {
+            let seen = seen.clone();
+            move |request: axum::extract::Request| {
+                let seen = seen.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("read upstream request body");
+                    let body: Value = serde_json::from_slice(&bytes).expect("anthropic json body");
+                    let max_tokens = body["max_tokens"].as_u64().expect("max_tokens present");
+                    seen.lock().await.push(max_tokens);
+                    if max_tokens > 32000 {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            format!(
+                                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"max_tokens: {max_tokens} > 32000, which is the maximum allowed number of output tokens for claude-opus-5-5"}}}}"#
+                            ),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            UPSTREAM_SSE.to_string(),
+                        )
+                    }
+                }
+            }
+        };
+        let mock_app = Router::new().route("/v1/messages", post(handler));
+        let mock_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock upstream");
+        let mock_addr = mock_listener.local_addr().expect("mock upstream address");
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("serve mock upstream");
+        });
+
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let mut provider = Provider::with_id(
+            "rect-e2e-limit".to_string(),
+            "Anthropic relay".to_string(),
+            json!({
+                "base_url": format!("http://{mock_addr}"),
+                "auth": {"OPENAI_API_KEY": "upstream-secret"}
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            max_output_tokens: Some(64000),
+            ..ProviderMeta::default()
+        });
+        db.save_provider(&AppType::Codex, &provider)
+            .expect("save provider");
+        db.set_current_provider(&AppType::Codex, &provider.id)
+            .expect("select provider");
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+        let client = reqwest::Client::new();
+        let request = json!({
+            "model": "claude-opus-5-5",
+            "stream": true,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let response = client
+                .post(format!("http://127.0.0.1:{}/v1/responses", proxy_info.port))
+                .json(&request)
+                .send()
+                .await
+                .expect("send request");
+            assert_eq!(response.status(), StatusCode::OK);
+            bodies.push(response.text().await.expect("read response body"));
+        }
+        // First request: 64000 rejected, retried at 32000. Second request: straight to 32000.
+        assert_eq!(*seen.lock().await, vec![64000, 32000, 32000]);
+        for body in &bodies {
+            assert!(body.contains("limit ok"), "{body}");
+            assert!(body.contains("response.completed"), "{body}");
+        }
+
+        proxy.stop().await.expect("stop test proxy");
+        mock_handle.abort();
+    }
+
     #[tokio::test]
     async fn codex_images_generation_aliases_forward_and_record_usage() {
         let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));

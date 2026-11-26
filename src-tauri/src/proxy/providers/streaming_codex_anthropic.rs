@@ -10,7 +10,8 @@ use super::codex_compaction;
 use super::codex_responses_sse as sse;
 use super::transform_codex_anthropic::{
     build_responses_usage_from_anthropic, map_anthropic_stop_reason_to_status,
-    responses_reasoning_item_from_anthropic_block,
+    responses_reasoning_item_from_anthropic_block, tool_needs_anthropic_input_wrapper,
+    unwrap_anthropic_tool_input,
 };
 #[cfg(test)]
 use super::transform_codex_anthropic::{
@@ -299,7 +300,10 @@ impl AnthropicToResponsesState {
                     .unwrap_or("");
                 block.accum.push_str(partial);
                 // The Read tool needs to be sanitized at close time, to avoid emitting pages:"" deltas mid-stream
-                if block.name == "Read" || self.tool_context.is_custom_tool_chat_name(&block.name) {
+                if block.name == "Read"
+                    || self.tool_context.is_custom_tool_chat_name(&block.name)
+                    || tool_needs_anthropic_input_wrapper(&block.name, &self.tool_context)
+                {
                     return Vec::new();
                 }
                 vec![sse::function_call_arguments_delta(
@@ -367,6 +371,26 @@ impl AnthropicToResponsesState {
                 } else {
                     text
                 };
+                let is_wrapped = tool_needs_anthropic_input_wrapper(&name, &self.tool_context);
+                let raw_input = if is_wrapped {
+                    let decoded = serde_json::from_str(&raw_input)
+                        .map_err(|error| error.to_string())
+                        .and_then(|input| {
+                            unwrap_anthropic_tool_input(&name, input, &self.tool_context)
+                                .map_err(|error| error.to_string())
+                        });
+                    match decoded {
+                        Ok(input) => input.to_string(),
+                        Err(error) => {
+                            return self
+                                .failed_event(error, Some("invalid_tool_arguments".to_string()))
+                                .into_iter()
+                                .collect();
+                        }
+                    }
+                } else {
+                    raw_input
+                };
                 let arguments = if raw_input.trim().is_empty() {
                     "{}".to_string()
                 } else if name == "Read" {
@@ -398,6 +422,13 @@ impl AnthropicToResponsesState {
                             input,
                         ));
                     } else {
+                        if is_wrapped {
+                            events.push(sse::function_call_arguments_delta(
+                                output_index,
+                                &item_id,
+                                &arguments,
+                            ));
+                        }
                         events.push(sse::function_call_arguments_done(
                             output_index,
                             &item_id,
@@ -454,10 +485,97 @@ impl AnthropicToResponsesState {
             })
     }
 
+    /// Content-free evidence of what the upstream actually cached for this response,
+    /// including the 5m/1h split when the gateway passes it through. A request's
+    /// `ttl` field alone does not prove a 1h write happened.
+    fn log_cache_usage(&self) {
+        let number = |value: Option<&Value>| value.and_then(Value::as_u64);
+        let read = number(self.anthropic_usage.get("cache_read_input_tokens")).unwrap_or(0);
+        let write = number(self.anthropic_usage.get("cache_creation_input_tokens")).unwrap_or(0);
+        let detail = self
+            .anthropic_usage
+            .get("cache_creation")
+            .and_then(Value::as_object);
+        let split = |key: &str| {
+            detail
+                .and_then(|object| number(object.get(key)))
+                .map_or_else(|| "n/a".to_string(), |value| value.to_string())
+        };
+        if read == 0 && write == 0 && detail.is_none() {
+            return;
+        }
+        log::info!(
+            "[CACHE_USAGE] model={} read={read} write={write} write_5m={} write_1h={} input={} output={}",
+            self.model,
+            split("ephemeral_5m_input_tokens"),
+            split("ephemeral_1h_input_tokens"),
+            number(self.anthropic_usage.get("input_tokens")).unwrap_or(0),
+            number(self.anthropic_usage.get("output_tokens")).unwrap_or(0),
+        );
+    }
+
+    /// A turn that hits `max_tokens` while still thinking produces only a reasoning
+    /// item. Codex then ends the turn with no message and no error, so the user sees
+    /// nothing and every "continue" burns the whole output budget again. Add a visible
+    /// explanation so the cause is never silent. Not used for network truncation,
+    /// compaction turns, or turns that already produced an answer or tool call.
+    fn truncated_thinking_notice(&mut self) -> Vec<Bytes> {
+        if self.stop_reason.as_deref() != Some("max_tokens")
+            || self.stream_truncated
+            || self.tool_context.is_compaction_request()
+        {
+            return Vec::new();
+        }
+        let has_answer = self.output_items.iter().any(|(_, item)| {
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") | None => false,
+                Some("message") => {
+                    item.get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        })
+                }
+                Some(_) => true,
+            }
+        });
+        if has_answer {
+            return Vec::new();
+        }
+        let used = self
+            .anthropic_usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        log::warn!(
+            "[Codex] Output limit reached while thinking (output_tokens={used}); no answer produced"
+        );
+        let text = format!(
+            "[CC Switch] 本轮输出已达到上限（{used} tokens），全部用于推理，模型还没有给出回答或工具调用。\
+             请提高该供应商的 maxOutputTokens，或降低推理强度后再发送“继续”。"
+        );
+        let output_index = self.next_output_index();
+        let item_id = response_message_item_id_indexed(&self.response_id, output_index);
+        let mut events = vec![
+            sse::message_item_added(output_index, &item_id),
+            sse::message_content_part_added(output_index, &item_id),
+            sse::output_text_delta(output_index, &item_id, &text),
+        ];
+        let (close, item) = sse::message_close(output_index, &item_id, &text);
+        events.extend(close);
+        self.output_items.push((output_index, item));
+        events
+    }
+
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
         }
+        self.log_cache_usage();
         let mut events = self.ensure_response_started();
 
         // Close out any blocks that are still open
@@ -470,6 +588,7 @@ impl AnthropicToResponsesState {
         for index in open {
             events.extend(self.close_block(index));
         }
+        events.extend(self.truncated_thinking_notice());
 
         if self.tool_context.is_compaction_request() {
             return self.finish_compaction(events);
@@ -851,6 +970,128 @@ mod tests {
             .collect()
     }
 
+    fn union_tool_context() -> CodexToolContext {
+        super::super::transform_codex_chat::build_codex_tool_context_from_request(&json!({
+            "tools": [{
+                "type": "namespace", "name": "fixture",
+                "tools": [{
+                    "type": "function", "name": "union",
+                    "parameters": {
+                        "anyOf": [
+                            { "type": "object", "required": ["mode"] },
+                            { "type": "object", "required": ["name"] }
+                        ]
+                    }
+                }]
+            }]
+        }))
+    }
+
+    fn parsed_fixture_events(stream: &str) -> Vec<Value> {
+        stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wrapped_arguments_are_unwrapped_after_all_stream_fragments() {
+        let upstream = [
+            json!({"type":"message_start","message":{"id":"msg_union"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"call_union","name":"fixture__union","input":{}
+            }}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"{\"_ccs_in"
+            }}),
+            json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"put\":{\"mode\":\"read\"}}"
+            }}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let result = run_with_context(&upstream, union_tool_context()).await;
+        assert!(!result.contains("_ccs_input"));
+        let events = parsed_fixture_events(&result);
+        let deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<Value>(&deltas).unwrap(),
+            json!({"mode":"read"})
+        );
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(done["arguments"].as_str().unwrap()).unwrap(),
+            json!({"mode":"read"})
+        );
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let call = &completed["response"]["output"][0];
+        assert_eq!(call["name"], "union");
+        assert_eq!(call["namespace"], "fixture");
+    }
+
+    #[tokio::test]
+    async fn wrapped_arguments_in_start_only_and_json_responses_are_unwrapped() {
+        let message = json!({
+            "id":"msg_union","type":"message","model":"claude-opus-5-5",
+            "role":"assistant","stop_reason":"tool_use",
+            "content":[{
+                "type":"tool_use","id":"call_union","name":"fixture__union",
+                "input":{"_ccs_input":{"name":"test"}}
+            }]
+        });
+        for upstream in [
+            message.to_string(),
+            [
+                json!({"type":"message_start","message":{"id":"msg_union"}}),
+                json!({"type":"content_block_start","index":0,"content_block":message["content"][0]}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                json!({"type":"message_stop"})
+            ].into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>()
+        ] {
+            let result = run_with_context(&upstream, union_tool_context()).await;
+            assert!(!result.contains("_ccs_input"));
+            let events = parsed_fixture_events(&result);
+            let completed = events.iter().find(|event|
+                event["type"] == "response.completed").unwrap();
+            let call = &completed["response"]["output"][0];
+            assert_eq!(serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+                       json!({"name":"test"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_wrapped_stream_fails_without_publishing_tool_arguments() {
+        let upstream = json!({
+            "id":"msg_invalid","type":"message","model":"claude-opus-5-5",
+            "role":"assistant","stop_reason":"tool_use",
+            "content":[{
+                "type":"tool_use","id":"call_union","name":"fixture__union",
+                "input":{"wrong":"shape"}
+            }]
+        })
+        .to_string();
+        let result = run_with_context(&upstream, union_tool_context()).await;
+        assert!(result.contains("event: response.failed"));
+        assert!(!result.contains("event: response.completed"));
+        assert!(!result.contains("response.function_call_arguments.done"));
+    }
+
     fn render_message_events(body: &Value) -> String {
         responses_sse_events_from_anthropic_message(body, CodexToolContext::default())
             .into_iter()
@@ -1144,6 +1385,50 @@ mod tests {
         let merged = run(input).await;
         assert!(merged.contains("\"status\":\"incomplete\""));
         assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn test_thinking_only_max_tokens_adds_visible_notice() {
+        let thinking = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tk\",\"model\":\"claude\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":16384}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let merged = run(thinking).await;
+        assert!(merged.contains("\"type\":\"reasoning\""));
+        assert!(merged.contains("[CC Switch] 本轮输出已达到上限（16384 tokens）"));
+        assert!(merged.contains("\"status\":\"incomplete\""));
+        assert!(merged.contains("\"reason\":\"max_output_tokens\""));
+
+        // A truncated answer, a tool call, or a normal end must not get the notice.
+        let answer = thinking.replace(
+            "event: message_delta",
+            concat!(
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"real answer\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "event: message_delta"
+            ),
+        );
+        let merged = run(&answer).await;
+        assert!(merged.contains("real answer"));
+        assert!(!merged.contains("[CC Switch]"));
+        let normal = thinking.replace("max_tokens", "end_turn");
+        assert!(!run(&normal).await.contains("[CC Switch]"));
     }
 
     #[tokio::test]

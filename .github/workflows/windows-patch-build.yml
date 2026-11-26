@@ -1,0 +1,54 @@
+name: Windows patch build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: 3
+      NO_PROXY: 127.0.0.1,localhost,::1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.100.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+      - name: Build production frontend
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.12.3 --activate
+          pnpm install --frozen-lockfile
+          pnpm build:renderer
+      - name: Full native proxy regression
+        run: |
+          $env:CC_SWITCH_TEST_HOME = Join-Path $env:RUNNER_TEMP 'cc-switch-native-tests'
+          cargo test --release --locked --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml --lib proxy:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build production executable and MSI
+        run: |
+          cargo build --release --locked --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm tauri bundle --bundles msi --no-sign --no-binary-patching --ci --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare artifacts
+        run: |
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          Copy-Item 'src-tauri/target/release/bundle/msi/*.msi' 'release-assets/CC-Switch-4.0.38-Claude-Fix.4-Windows-x64.msi'
+          Copy-Item 'src-tauri/target/release/cc-switch.exe' 'release-assets/cc-switch.exe'
+          Get-ChildItem release-assets -File | ForEach-Object { (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() + '  ' + $_.Name } | Set-Content release-assets/SHA256SUMS -Encoding utf8
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cc-switch-windows-x64
+          path: release-assets/*

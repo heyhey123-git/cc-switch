@@ -855,6 +855,7 @@ impl RequestForwarder {
             let mut budget_rectifier_retried = false;
             let mut media_rectifier_retried = false;
             let mut opaque_rectifier_retried = false;
+            let mut max_tokens_rectifier_retried = false;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -1358,6 +1359,73 @@ impl RequestForwarder {
                                             provider,
                                             app_type,
                                             "budget 整流",
+                                            &mut last_error,
+                                            &mut last_provider,
+                                        )
+                                        .await
+                                    {
+                                        return Err(err);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Codex → Anthropic: the requested output ceiling is above what this
+                    // upstream model accepts. A 400 validation error bills nothing, so learn
+                    // the stated limit and retry once instead of failing every request.
+                    if matches!(app_type, AppType::Codex)
+                        && attempted_codex_upstream_format == Some(CodexUpstreamFormat::Anthropic)
+                        && !max_tokens_rectifier_retried
+                        && matches!(
+                            &e,
+                            ProxyError::UpstreamError {
+                                status: 400 | 422,
+                                ..
+                            }
+                        )
+                    {
+                        if let Some(limit) = super::max_tokens_rectifier::output_limit_from_error(
+                            extract_error_message(&e).as_deref(),
+                        ) {
+                            log::warn!(
+                                "[{app_type_str}] [RECT-020] 上游声明最大输出 {limit} tokens，记录后重试一次"
+                            );
+                            super::max_tokens_rectifier::learn(&provider.id, limit);
+                            max_tokens_rectifier_retried = true;
+                            let mut limit_retry_codex_upstream_format = None;
+                            match self
+                                .forward(
+                                    &attempt,
+                                    std::mem::take(provider_body.get().map_err(replay_error)?),
+                                    None,
+                                    &mut limit_retry_codex_upstream_format,
+                                )
+                                .await
+                            {
+                                Ok(forwarded) => {
+                                    log::info!("[{app_type_str}] [RECT-021] 输出上限整流重试成功");
+                                    return Ok(self
+                                        .finish_success(
+                                            provider,
+                                            app_type,
+                                            used_half_open_permit,
+                                            forwarded,
+                                            limit_retry_codex_upstream_format,
+                                        )
+                                        .await);
+                                }
+                                Err(retry_err) => {
+                                    log::warn!(
+                                        "[{app_type_str}] [RECT-022] 输出上限整流重试仍失败: {retry_err}"
+                                    );
+                                    if let Some(err) = self
+                                        .handle_rectifier_retry_failure(
+                                            retry_err,
+                                            provider,
+                                            app_type,
+                                            "输出上限整流",
                                             &mut last_error,
                                             &mut last_provider,
                                         )
@@ -2024,6 +2092,7 @@ impl RequestForwarder {
         // Codex→Anthropic: when the model name carries the [1m] marker, strip the
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
+        let mut codex_cache_attempt = None;
 
         // 转换请求体（如果需要）
         privacy_dirty |= codex_responses_to_chat || codex_responses_to_anthropic || needs_transform;
@@ -2090,16 +2159,29 @@ impl RequestForwarder {
             // lets the thinking-budget clamp size its headroom against the real
             // ceiling too. Kept per-provider to avoid a global large default that
             // would 400 on low-output-ceiling gateways.
-            if let Some(max_out) = provider
+            let provider_cap = provider
                 .meta
                 .as_ref()
                 .and_then(|meta| meta.max_output_tokens)
-                .filter(|v| *v > 0)
-            {
-                mapped_body["max_output_tokens"] = Value::from(max_out);
+                .filter(|v| *v > 0);
+            // A ceiling the upstream already stated in a 400 (see max_tokens_rectifier)
+            // keeps later requests under it instead of failing each one.
+            let learned_ceiling = super::max_tokens_rectifier::learned(&provider.id);
+            if provider_cap.is_some() || learned_ceiling.is_some() {
+                mapped_body["max_output_tokens"] =
+                    Value::from(super::max_tokens_rectifier::effective_max_output_tokens(
+                        provider_cap,
+                        mapped_body
+                            .get("max_output_tokens")
+                            .and_then(Value::as_u64),
+                        super::providers::transform_codex_anthropic::DEFAULT_CODEX_ANTHROPIC_MAX_TOKENS,
+                        learned_ceiling,
+                    ));
             }
             // Anthropic requires max_tokens, and Codex never sends max_output_tokens,
             // so this default applies to every request without a provider override.
+            let compaction_turn =
+                super::providers::codex_compaction::is_compaction_request(&mapped_body);
             let mut anthropic_body =
                 super::providers::transform_codex_anthropic::responses_request_to_anthropic(
                     mapped_body,
@@ -2125,9 +2207,11 @@ impl RequestForwarder {
             // otherwise system/tools/history are re-sent at full price every round,
             // inflating cost and first-token latency. The injector handles the
             // string→array `system` conversion and the new-breakpoint budget.
-            super::cache_injector::inject(
+            codex_cache_attempt = super::cache_diagnostics::inject_and_record(
+                &provider.id,
+                &self.session_id,
                 &mut anthropic_body,
-                &codex_anthropic_cache_config(&self.optimizer_config),
+                &codex_anthropic_cache_config_for_turn(&self.optimizer_config, compaction_turn),
             );
             anthropic_body
         } else if needs_transform {
@@ -2670,6 +2754,9 @@ impl RequestForwarder {
                         })
                     }));
                 }
+            }
+            if let Some(attempt) = codex_cache_attempt {
+                attempt.accept();
             }
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {

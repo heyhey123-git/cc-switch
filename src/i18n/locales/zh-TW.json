@@ -544,7 +544,9 @@
         "thinkingOptimizer": "Thinking 最佳化",
         "thinkingOptimizerDescription": "自動為 Opus/Sonnet 啟用 Adaptive Thinking，為舊模型注入 Extended Thinking",
         "cacheInjection": "Cache 注入",
-        "cacheInjectionDescription": "自動在請求關鍵位置注入標準 5 分鐘 Cache 斷點，減少重複 token 計費"
+        "cacheInjectionDescription": "自動在請求關鍵位置注入標準 5 分鐘 Cache 斷點，減少重複 token 計費",
+        "cacheTtlMode": "Claude 快取時長",
+        "cacheTtlModeDescription": "5m：預設。1h：所有斷點一小時（寫入 2 倍價）。混合：長歷史 1h，近期尾部 5m。"
       },
       "logConfig": {
         "title": "應用程式診斷日誌",

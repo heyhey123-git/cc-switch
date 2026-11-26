@@ -2,7 +2,7 @@
 //!
 //! 在请求转发前自动注入 cache_control 标记，启用 Bedrock Prompt Caching
 
-use super::types::{CacheTtlMode, OptimizerConfig};
+use super::types::OptimizerConfig;
 use serde_json::{json, Value};
 
 /// 在请求体关键位置注入 cache_control 断点
@@ -10,36 +10,11 @@ pub fn inject(body: &mut Value, config: &OptimizerConfig) {
     inject_with_anchor(body, config, None);
 }
 
-/// Positions are (message index, content block index).
-#[derive(Clone, Copy, Default)]
-pub(crate) struct CacheAnchors {
-    /// Newest breakpoint of the previous accepted request (5m tail).
-    pub previous: Option<(usize, usize)>,
-    /// 1h long-history breakpoint of the previous accepted request (mixed mode).
-    pub long: Option<(usize, usize)>,
-}
-
 pub(crate) fn inject_with_anchor(
     body: &mut Value,
     config: &OptimizerConfig,
     previous_anchor: Option<(usize, usize)>,
 ) {
-    inject_with_anchors(
-        body,
-        config,
-        CacheAnchors {
-            previous: previous_anchor,
-            long: None,
-        },
-    );
-}
-
-pub(crate) fn inject_with_anchors(
-    body: &mut Value,
-    config: &OptimizerConfig,
-    anchors: CacheAnchors,
-) {
-    let previous_anchor = anchors.previous;
     if !config.enabled || !config.cache_injection {
         return;
     }
@@ -55,17 +30,6 @@ pub(crate) fn inject_with_anchors(
         );
     }
 
-    if config.cache_ttl_mode == CacheTtlMode::Mixed && existing == 0 {
-        if inject_mixed(body, config, anchors) {
-            return;
-        }
-        // Context too small for a 1h anchor: behave exactly like 5m mode.
-    }
-    let ttl = match config.cache_ttl_mode {
-        CacheTtlMode::OneHour => Some("1h"),
-        _ => None,
-    };
-
     let mut budget = 4_usize.saturating_sub(existing);
     if budget == 0 {
         log::info!("[OPT] cache: no-op(existing={existing})");
@@ -80,7 +44,7 @@ pub(crate) fn inject_with_anchors(
             if let Some(last) = tools.last_mut() {
                 if last.get("cache_control").is_none() {
                     if let Some(o) = last.as_object_mut() {
-                        o.insert("cache_control".to_string(), make_cache_control(ttl));
+                        o.insert("cache_control".to_string(), make_cache_control());
                     }
                     budget -= 1;
                     injected.push("tools");
@@ -104,7 +68,7 @@ pub(crate) fn inject_with_anchors(
             if let Some(last) = system.last_mut() {
                 if last.get("cache_control").is_none() {
                     if let Some(o) = last.as_object_mut() {
-                        o.insert("cache_control".to_string(), make_cache_control(ttl));
+                        o.insert("cache_control".to_string(), make_cache_control());
                     }
                     budget -= 1;
                     injected.push("system");
@@ -118,7 +82,7 @@ pub(crate) fn inject_with_anchors(
     if budget > 0 {
         if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for message in messages.iter_mut().rev() {
-                if inject_message_breakpoint(message, ttl) {
+                if inject_message_breakpoint(message) {
                     budget -= 1;
                     injected.push("msgs-latest");
                     break;
@@ -136,7 +100,7 @@ pub(crate) fn inject_with_anchors(
                         .and_then(Value::as_array_mut)
                         .and_then(|blocks| blocks.get_mut(block_index))
                     {
-                        if inject_block_breakpoint(block, ttl) {
+                        if inject_block_breakpoint(block) {
                             budget -= 1;
                             injected.push("msgs-previous-request");
                         }
@@ -155,7 +119,7 @@ pub(crate) fn inject_with_anchors(
                     }
                     user_count += 1;
                     if user_count == 2 {
-                        if inject_message_breakpoint(message, ttl) {
+                        if inject_message_breakpoint(message) {
                             injected.push("msgs-prior-user");
                         }
                         break;
@@ -169,185 +133,11 @@ pub(crate) fn inject_with_anchors(
         "[OPT] cache: {}bp({},{},pre={existing})",
         injected.len(),
         injected.join("+"),
-        ttl.unwrap_or("5m"),
+        "5m",
     );
 }
 
-fn is_thinking(block: &Value) -> bool {
-    matches!(
-        block.get("type").and_then(Value::as_str),
-        Some("thinking" | "redacted_thinking")
-    )
-}
-
-/// Cheap content-size estimate in characters; images and documents count as a
-/// fixed size because their token cost is not proportional to base64 length.
-fn estimate_block_chars(block: &Value) -> usize {
-    match block {
-        Value::String(text) => text.len(),
-        Value::Array(items) => items.iter().map(estimate_block_chars).sum(),
-        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("text") => object
-                .get("text")
-                .and_then(Value::as_str)
-                .map_or(0, str::len),
-            Some("thinking") => object
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map_or(0, str::len),
-            Some("image" | "document") => 8_000,
-            Some("tool_result") => object.get("content").map_or(0, estimate_block_chars),
-            Some("tool_use") => {
-                object
-                    .get("input")
-                    .map_or(0, |input| input.to_string().len())
-                    + 100
-            }
-            _ => 200,
-        },
-        _ => 0,
-    }
-}
-
-fn message_blocks(message: &Value) -> Vec<&Value> {
-    match message.get("content") {
-        Some(Value::Array(blocks)) => blocks.iter().collect(),
-        Some(other) => vec![other],
-        None => Vec::new(),
-    }
-}
-
-fn prefix_fixed_chars(body: &Value) -> usize {
-    let mut chars = 0;
-    for field in ["tools", "system"] {
-        if let Some(value) = body.get(field) {
-            chars += estimate_block_chars(value).max(match value {
-                Value::Array(items) => items.iter().map(|v| v.to_string().len()).sum(),
-                _ => 0,
-            });
-        }
-    }
-    chars
-}
-
-/// Mixed TTL layout: system(1h, covers tools) + long history anchor(1h) followed
-/// by 5m previous-request / latest breakpoints. Returns false (nothing changed)
-/// when the context is too small to justify a 1h anchor.
-fn inject_mixed(body: &mut Value, config: &OptimizerConfig, anchors: CacheAnchors) -> bool {
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return false;
-    };
-    // Positions of eligible (non-thinking, array-content) blocks with cumulative size.
-    let mut points: Vec<((usize, usize), usize)> = Vec::new();
-    let mut cumulative = prefix_fixed_chars(body);
-    let mut latest_pos = None;
-    for (mi, message) in messages.iter().enumerate() {
-        let blocks = message_blocks(message);
-        let is_array = message.get("content").map_or(false, Value::is_array);
-        for (bi, block) in blocks.iter().enumerate() {
-            cumulative += estimate_block_chars(block);
-            if is_array && !is_thinking(block) && block.is_object() {
-                points.push(((mi, bi), cumulative));
-                latest_pos = Some((mi, bi));
-            }
-        }
-    }
-    let total = cumulative;
-    let Some(latest) = latest_pos else {
-        return false;
-    };
-    if total < config.cache_long_min_chars {
-        return false;
-    }
-    let cum_at = |pos: (usize, usize)| points.iter().find(|(p, _)| *p == pos).map(|(_, c)| *c);
-
-    // Newest eligible point that still leaves >= tail_keep chars after it.
-    let target = points
-        .iter()
-        .rev()
-        .find(|(pos, c)| *pos < latest && total - *c >= config.cache_tail_keep_chars)
-        .map(|(pos, c)| (*pos, *c));
-
-    let long = match (anchors.long.and_then(|p| cum_at(p).map(|c| (p, c))), target) {
-        (Some((prev, prev_c)), Some((t, t_c))) => {
-            if t > prev && t_c - prev_c >= config.cache_long_advance_chars {
-                Some(t)
-            } else {
-                Some(prev)
-            }
-        }
-        (Some((prev, _)), None) => Some(prev),
-        (None, Some((t, _))) => Some(t),
-        (None, None) => None,
-    };
-    let Some(long) = long else {
-        return false;
-    };
-
-    let mut injected = Vec::new();
-    let one_hour = Some("1h");
-    // system (preferred, covers tools) else last tool, both at 1h.
-    if let Some(text) = body
-        .get("system")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    {
-        body["system"] = json!([{"type": "text", "text": text}]);
-    }
-    let mut prefix_marked = false;
-    if let Some(last) = body
-        .get_mut("system")
-        .and_then(Value::as_array_mut)
-        .and_then(|v| v.last_mut())
-    {
-        if inject_block_breakpoint(last, one_hour) {
-            prefix_marked = true;
-            injected.push("system:1h");
-        }
-    }
-    if !prefix_marked {
-        if let Some(last) = body
-            .get_mut("tools")
-            .and_then(Value::as_array_mut)
-            .and_then(|v| v.last_mut())
-        {
-            if inject_block_breakpoint(last, one_hour) {
-                injected.push("tools:1h");
-            }
-        }
-    }
-    let mut mark =
-        |body: &mut Value, pos: (usize, usize), ttl: Option<&str>, label: &'static str| {
-            if let Some(block) = body
-                .get_mut("messages")
-                .and_then(|m| m.get_mut(pos.0))
-                .and_then(|m| m.get_mut("content"))
-                .and_then(Value::as_array_mut)
-                .and_then(|b| b.get_mut(pos.1))
-            {
-                if inject_block_breakpoint(block, ttl) {
-                    injected.push(label);
-                }
-            }
-        };
-    mark(body, long, one_hour, "msgs-long:1h");
-    if let Some(prev) = anchors.previous {
-        if prev > long && prev < latest {
-            mark(body, prev, None, "msgs-previous-request:5m");
-        }
-    }
-    mark(body, latest, None, "msgs-latest:5m");
-    log::info!(
-        "[OPT] cache: {}bp({},mixed,chars={total},long=({},{}))",
-        injected.len(),
-        injected.join("+"),
-        long.0,
-        long.1
-    );
-    true
-}
-
-fn inject_message_breakpoint(message: &mut Value, ttl: Option<&str>) -> bool {
+fn inject_message_breakpoint(message: &mut Value) -> bool {
     let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
         return false;
     };
@@ -359,10 +149,10 @@ fn inject_message_breakpoint(message: &mut Value, ttl: Option<&str>) -> bool {
     }) else {
         return false;
     };
-    inject_block_breakpoint(block, ttl)
+    inject_block_breakpoint(block)
 }
 
-fn inject_block_breakpoint(block: &mut Value, ttl: Option<&str>) -> bool {
+fn inject_block_breakpoint(block: &mut Value) -> bool {
     if matches!(
         block.get("type").and_then(Value::as_str),
         Some("thinking" | "redacted_thinking")
@@ -373,15 +163,12 @@ fn inject_block_breakpoint(block: &mut Value, ttl: Option<&str>) -> bool {
     let Some(object) = block.as_object_mut() else {
         return false;
     };
-    object.insert("cache_control".to_string(), make_cache_control(ttl));
+    object.insert("cache_control".to_string(), make_cache_control());
     true
 }
 
-fn make_cache_control(ttl: Option<&str>) -> Value {
-    match ttl {
-        Some(ttl) => json!({"type": "ephemeral", "ttl": ttl}),
-        None => json!({"type": "ephemeral"}),
-    }
+fn make_cache_control() -> Value {
+    json!({"type": "ephemeral"})
 }
 
 fn count_existing(body: &Value) -> usize {
@@ -425,7 +212,6 @@ mod tests {
             enabled: true,
             thinking_optimizer: true,
             cache_injection: true,
-            ..OptimizerConfig::default()
         }
     }
 
@@ -682,150 +468,5 @@ mod tests {
         assert!(body["messages"][1]["content"][0]
             .get("cache_control")
             .is_some());
-    }
-
-    fn mixed_config() -> OptimizerConfig {
-        OptimizerConfig {
-            enabled: true,
-            cache_ttl_mode: CacheTtlMode::Mixed,
-            cache_long_min_chars: 1_000,
-            cache_long_advance_chars: 2_000,
-            cache_tail_keep_chars: 500,
-            ..OptimizerConfig::default()
-        }
-    }
-
-    fn turns(n: usize, size: usize) -> Value {
-        let mut messages = Vec::new();
-        for i in 0..n {
-            messages.push(json!({"role":"user","content":[{"type":"text","text":format!("{i}{}", "u".repeat(size))}]}));
-            messages.push(
-                json!({"role":"assistant","content":[{"type":"text","text":"a".repeat(size)}]}),
-            );
-        }
-        messages.push(json!({"role":"user","content":[{"type":"text","text":"now"}]}));
-        json!({"tools":[{"name":"t"}],"system":[{"type":"text","text":"sys"}],"messages":messages})
-    }
-
-    /// TTL of every marker in wire order: tools, system, messages.
-    fn wire_ttls(body: &Value) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut visit = |v: &Value| {
-            if let Some(cc) = v.get("cache_control") {
-                out.push(
-                    cc.get("ttl")
-                        .and_then(Value::as_str)
-                        .unwrap_or("5m")
-                        .to_string(),
-                );
-            }
-        };
-        for f in ["tools", "system"] {
-            for b in body[f].as_array().into_iter().flatten() {
-                visit(b);
-            }
-        }
-        for m in body["messages"].as_array().into_iter().flatten() {
-            for b in m["content"].as_array().into_iter().flatten() {
-                visit(b);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn mixed_small_context_matches_five_minute_mode() {
-        let mut mixed = turns(1, 10);
-        let mut plain = mixed.clone();
-        inject(&mut mixed, &mixed_config());
-        inject(&mut plain, &default_config());
-        assert_eq!(mixed, plain);
-        assert!(wire_ttls(&mixed).iter().all(|t| t == "5m"));
-    }
-
-    #[test]
-    fn mixed_large_context_orders_one_hour_before_five_minute() {
-        let mut body = turns(6, 800);
-        inject(&mut body, &mixed_config());
-        let ttls = wire_ttls(&body);
-        assert!(ttls.len() <= 4);
-        let first_5m = ttls.iter().position(|t| t == "5m").unwrap();
-        assert!(ttls[..first_5m].iter().all(|t| t == "1h"));
-        assert!(ttls[first_5m..].iter().all(|t| t == "5m"));
-        assert_eq!(ttls.iter().filter(|t| *t == "1h").count(), 2);
-        // The system marker is 1h and covers tools; tools stay unmarked.
-        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
-        assert!(body["tools"][0].get("cache_control").is_none());
-        // The newest block is a 5m tail marker.
-        let last = body["messages"].as_array().unwrap().last().unwrap();
-        assert!(last["content"][0]["cache_control"].get("ttl").is_none());
-    }
-
-    #[test]
-    fn mixed_long_anchor_is_kept_until_growth_threshold() {
-        let mut first = turns(6, 800);
-        inject(&mut first, &mixed_config());
-        let long_pos = |b: &Value| {
-            b["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .find_map(|(i, m)| {
-                    (m["content"][0]["cache_control"]["ttl"] == "1h").then_some((i, 0))
-                })
-        };
-        let anchor = long_pos(&first).unwrap();
-
-        let mut small_growth = turns(6, 800);
-        small_growth["messages"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"assistant","content":[{"type":"text","text":"x".repeat(600)}]}));
-        small_growth["messages"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","content":[{"type":"text","text":"more"}]}));
-        inject_with_anchors(
-            &mut small_growth,
-            &mixed_config(),
-            CacheAnchors {
-                previous: None,
-                long: Some(anchor),
-            },
-        );
-        assert_eq!(long_pos(&small_growth), Some(anchor));
-
-        let mut big_growth = turns(12, 800);
-        inject_with_anchors(
-            &mut big_growth,
-            &mixed_config(),
-            CacheAnchors {
-                previous: None,
-                long: Some(anchor),
-            },
-        );
-        assert!(long_pos(&big_growth).unwrap() > anchor);
-    }
-
-    #[test]
-    fn mixed_skips_when_caller_supplied_markers() {
-        let mut body = turns(6, 800);
-        body["messages"][0]["content"][0]["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
-        inject(&mut body, &mixed_config());
-        assert!(!wire_ttls(&body).iter().any(|_| false));
-        assert_eq!(wire_ttls(&body).iter().filter(|t| *t == "1h").count(), 1);
-    }
-
-    #[test]
-    fn one_hour_mode_marks_every_injected_breakpoint() {
-        let mut body = turns(1, 10);
-        let config = OptimizerConfig {
-            cache_ttl_mode: CacheTtlMode::OneHour,
-            ..default_config()
-        };
-        inject(&mut body, &config);
-        let ttls = wire_ttls(&body);
-        assert!(ttls.len() >= 3 && ttls.iter().all(|t| t == "1h"));
     }
 }

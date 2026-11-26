@@ -2180,8 +2180,6 @@ impl RequestForwarder {
             }
             // Anthropic requires max_tokens, and Codex never sends max_output_tokens,
             // so this default applies to every request without a provider override.
-            let compaction_turn =
-                super::providers::codex_compaction::is_compaction_request(&mapped_body);
             let mut anthropic_body =
                 super::providers::transform_codex_anthropic::responses_request_to_anthropic(
                     mapped_body,
@@ -2211,7 +2209,7 @@ impl RequestForwarder {
                 &provider.id,
                 &self.session_id,
                 &mut anthropic_body,
-                &codex_anthropic_cache_config_for_turn(&self.optimizer_config, compaction_turn),
+                &codex_anthropic_cache_config(&self.optimizer_config),
             );
             anthropic_body
         } else if needs_transform {

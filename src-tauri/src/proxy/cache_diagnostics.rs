@@ -103,8 +103,6 @@ struct Snapshot {
     messages: Vec<Hash>,
     positions: Vec<(usize, usize)>,
     breakpoints: Vec<usize>,
-    /// Index into `positions` of the 1h long-history breakpoint, if any.
-    long_anchor: Option<usize>,
     total_blocks: usize,
     thinking_blocks: usize,
 }
@@ -155,7 +153,6 @@ impl Snapshot {
             messages,
             positions,
             breakpoints: Vec::new(),
-            long_anchor: None,
             total_blocks,
             thinking_blocks,
         }
@@ -186,37 +183,14 @@ impl Snapshot {
         })
     }
 
-    /// The previous request's 1h history breakpoint, if its whole prefix is
-    /// unchanged and the 1h entry cannot have expired.
-    fn previous_long_anchor(&self, previous: &Self) -> Option<(usize, usize)> {
-        if self.tools != previous.tools
-            || self.system != previous.system
-            || self.settings != previous.settings
-            || previous.at.elapsed().as_secs() >= 3600
-        {
-            return None;
-        }
-        let index = previous.long_anchor?;
-        (index < self.shared_blocks(previous))
-            .then(|| self.positions.get(index).copied())
-            .flatten()
-            .filter(|(_, block)| *block != usize::MAX)
-    }
-
     fn update_breakpoints(&mut self, body: &Value) {
         self.breakpoints.clear();
-        self.long_anchor = None;
         for (index, (message, block)) in self.positions.iter().enumerate() {
             if body["messages"][*message]["content"]
                 .get(*block)
                 .and_then(|b| b.get("cache_control"))
                 .is_some()
             {
-                if body["messages"][*message]["content"][*block]["cache_control"]["ttl"].as_str()
-                    == Some("1h")
-                {
-                    self.long_anchor = Some(index);
-                }
                 if self.breakpoints.len() == 16 {
                     self.breakpoints.remove(0);
                 }
@@ -246,14 +220,10 @@ pub(crate) fn inject_and_record(
         super::cache_injector::inject(body, config);
         return None;
     };
-    let anchors = history
+    let anchor = history
         .get(&key)
-        .map(|previous| super::cache_injector::CacheAnchors {
-            previous: current.previous_anchor(previous),
-            long: current.previous_long_anchor(previous),
-        })
-        .unwrap_or_default();
-    super::cache_injector::inject_with_anchors(body, config, anchors);
+        .and_then(|previous| current.previous_anchor(previous));
+    super::cache_injector::inject_with_anchor(body, config, anchor);
     current.update_breakpoints(body);
     if let Some(previous) = history.get(&key) {
         log::info!("[CACHE_PREFIX] session={label} tools_changed={} system_changed={} settings_changed={} shared_blocks={} previous_blocks={} current_blocks={} thinking_blocks={}->{} elapsed_ms={}",
@@ -302,7 +272,6 @@ mod tests {
             enabled: true,
             thinking_optimizer: true,
             cache_injection: true,
-            ..super::super::types::OptimizerConfig::default()
         }
     }
 
@@ -444,57 +413,5 @@ mod tests {
         assert_ne!(Snapshot::new(&next).settings, first.settings);
         next["messages"][0]["content"][0]["text"] = json!("different");
         assert_eq!(Snapshot::new(&next).shared_blocks(&first), 0);
-    }
-
-    fn mixed() -> super::super::types::OptimizerConfig {
-        super::super::types::OptimizerConfig {
-            cache_ttl_mode: super::super::types::CacheTtlMode::Mixed,
-            cache_long_min_chars: 1_000,
-            cache_long_advance_chars: 100_000,
-            cache_tail_keep_chars: 500,
-            ..optimizer()
-        }
-    }
-
-    fn history(turns: usize) -> Value {
-        let mut messages = Vec::new();
-        for i in 0..turns {
-            messages.push(json!({"role":"user","content":[{"type":"text","text":format!("{i}{}","u".repeat(800))}]}));
-            messages.push(
-                json!({"role":"assistant","content":[{"type":"text","text":"a".repeat(800)}]}),
-            );
-        }
-        messages.push(json!({"role":"user","content":[{"type":"text","text":"now"}]}));
-        json!({"model":"m","tools":[{"name":"t"}],"system":[{"type":"text","text":"s"}],"messages":messages})
-    }
-
-    fn long_index(body: &Value) -> Option<usize> {
-        body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|m| m["content"][0]["cache_control"]["ttl"] == "1h")
-    }
-
-    #[test]
-    fn mixed_long_anchor_persists_across_accepted_requests_and_rolls_back() {
-        let (provider, session) = ("fixture-mixed", "mixed-session");
-        let mut a = history(6);
-        accepted_request(provider, session, &mut a, &mixed());
-        let anchor = long_index(&a).expect("long anchor");
-
-        // Growth below the advance threshold keeps the same 1h anchor.
-        let mut b = history(8);
-        accepted_request(provider, session, &mut b, &mixed());
-        assert_eq!(long_index(&b), Some(anchor));
-
-        // A failed (not accepted) request must not move the stored anchor.
-        let mut c = history(9);
-        c["messages"].as_array_mut().unwrap().truncate(19);
-        let attempt = inject_and_record(provider, session, &mut c, &mixed());
-        drop(attempt);
-        let mut d = history(9);
-        accepted_request(provider, session, &mut d, &mixed());
-        assert_eq!(long_index(&d), Some(anchor));
     }
 }

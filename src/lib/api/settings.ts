@@ -444,10 +444,6 @@ export interface OptimizerConfig {
   enabled: boolean;
   thinkingOptimizer: boolean;
   cacheInjection: boolean;
-  cacheTtlMode?: "5m" | "1h" | "mixed";
-  cacheLongMinChars?: number;
-  cacheLongAdvanceChars?: number;
-  cacheTailKeepChars?: number;
 }
 
 export interface PrivacyFilterConfig {

@@ -39,7 +39,7 @@ Windows 客户端验收使用独立 Codex 配置目录和本地模拟上游，�
 
 ### Windows 直接安装
 
-下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.42-claude-fix.7/CC-Switch-4.0.42-Claude-Fix.7-Windows-x64.msi)，
+下载 [Windows x64 安装包（MSI）](https://github.com/heyhey123-git/cc-switch/releases/download/v4.0.42-claude-fix.8/CC-Switch-4.0.42-Claude-Fix.8-Windows-x64.msi)，
 双击后按安装向导完成即可，不需要自己编译。适用于 Windows 10/11 x64；
 缺少 WebView2 时安装器会联网下载运行时。更新已有安装前先退出 CC Switch。
 
@@ -74,20 +74,22 @@ SSH 协作时，请求由服务器上的 Codex app-server 发起，因此服务�
 配置和密钥。`127.0.0.1:15721` 指服务器本机。这个部署不依赖 Windows CCS 或端口转发。
 已验证的目标是 Ubuntu 24.04 x86_64、Python 3.12；配置脚本要求 Python 3.11 或更高版本。
 
-Linux 接入目前只评估路径，暂不正式部署或发布 Linux 安装包。
-修复版 4 的 Linux x64 候选构建已通过 2001 项代理原生回归、无 DISPLAY 启停检查，
-以及 Ubuntu 24.04 上的 133 项本地模拟验收。
-独立 Codex app-server 实测覆盖 25 个工具、517828 字符历史、图片、压缩及压缩后继续，
-没有调用付费模型，也没有重启原有 Codex 进程。
-拟交付的文件为 `CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb`、`cc-switch-proxy@.service`、
+Linux 版没有作为 Release 资产发布，产物由工作流 `linux-proxy-build.yml` 在 GitHub Actions 中构建。
+Fix.8 对应的构建（提交 `6e8d64cb`）通过了代理原生回归、无 DISPLAY 启停和协议转换检查；
+2026-11-26 又在一台 Ubuntu 24.04 x86_64 服务器上用该二进制原位替换了旧版并以 headless 运行：
+先在私有网络与挂载命名空间里用真实数据的副本演练（数据库 v27 升到 v28，供应商、认证和客户端配置不变），
+再正式切换，没有调用付费模型，也没有重启原有 Codex 进程。
+Fix.4 阶段做过的 133 项本地模拟验收和 25 个工具的独立 Codex app-server 实测，没有针对 Fix.8 重跑。
+工作流输出 `CC-Switch-<版本>-Claude-Fix.<序号>-Linux-x64.deb`、`cc-switch-proxy@.service`、
 `configure-linux-proxy.py`、`SHA256SUMS` 和原始可执行文件 `cc-switch-linux-x64`。
-以下命令供评估部署流程，等待 Linux 方案确认及产物发布后再执行。
+以下命令用于新装。更新已有服务时，先等待没有模型请求，备份二进制、数据库和配置再替换；
+新版可能升级数据库结构，旧版二进制会因数据库版本过新而初始化失败，需要回退时要一并还原备份的数据库。
 下载后先核对 SHA256，再安装；二进制仍链接 GTK/WebKit 运行库，但 headless 模式不初始化图形界面，
 无需桌面、DISPLAY 或 Xvfb。桌面版和 headless 服务不要同时占用同一用户的配置及端口。
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
-sudo apt install ./CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb
+sudo apt install ./CC-Switch-<版本>-Claude-Fix.<序号>-Linux-x64.deb
 sudo install -m 644 cc-switch-proxy@.service /etc/systemd/system/
 ```
 

@@ -53,7 +53,8 @@ jobs:
       - name: Prepare verified artifacts
         run: |
           mkdir release-assets
-          cp src-tauri/target/release/bundle/deb/*.deb release-assets/CC-Switch-4.0.38-Claude-Fix.4-Linux-x64.deb
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          cp src-tauri/target/release/bundle/deb/*.deb "release-assets/CC-Switch-${version}-Claude-Fix.8-Linux-x64.deb"
           cp src-tauri/target/release/cc-switch release-assets/cc-switch-linux-x64
           cp packaging/linux/cc-switch-proxy@.service release-assets/
           cp scripts/configure-linux-proxy.py release-assets/
